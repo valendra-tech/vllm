@@ -370,6 +370,47 @@ def fused_qk_norm_rope(
     )
 
 
+def fused_qwen35_qknorm_rope_kv_insert(
+    q_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    qkv: torch.Tensor,
+    k_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    eps: float,
+    kv_cache_dtype: int,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    """Fused Q/K GemmaRMSNorm + partial interleaved MRoPE + gate copy +
+    paged KV-cache insert for Qwen3.8-27B full_attention layers (CUDA-only).
+
+    Mutates q_out, gate_out, k_out, key_cache, value_cache in place.
+    """
+    torch.ops._C.fused_qwen35_qknorm_rope_kv_insert(
+        q_out,
+        gate_out,
+        qkv,
+        k_out,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        key_cache,
+        value_cache,
+        eps,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

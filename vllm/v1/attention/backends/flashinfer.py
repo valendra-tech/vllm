@@ -2601,6 +2601,79 @@ class FlashInferImpl(AttentionImpl):
                 layer._v_scale,
             )
 
+    def fused_qwen35_qknorm_rope_kvcache_supported(self):
+        # CUDA-only fused Qwen3.5 QK-norm + partial MRoPE + gate + KV insert.
+        # The kernel is registered as a custom op; require it to be present.
+        return (
+            current_platform.is_cuda()
+            and hasattr(torch.ops._C, "fused_qwen35_qknorm_rope_kv_insert")
+        )
+
+    def do_qwen35_qknorm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        gate_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        # Split the paged kv_cache into K and V (flash layout: [B, 2*H, N, hs]).
+        if self.is_kvcache_nvfp4:
+            k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                self.num_kv_heads, dim=-2
+            )
+        else:
+            k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+        # Resolve KV cache dtype code for the kernel: 0=auto (bf16/fp16),
+        # 8=fp8 e4m3. nvfp4 is not supported by this kernel yet.
+        if self.cache_dtype == "auto":
+            kv_cache_dtype_code = 0
+        elif self.cache_dtype.startswith("fp8"):
+            kv_cache_dtype_code = 8
+        else:
+            raise NotImplementedError(
+                "fused_qwen35_qknorm_rope_kv_insert does not support "
+                f"kv_cache_dtype={self.cache_dtype}"
+            )
+        # The kernel expects the vLLM paged layout
+        # [num_blocks, num_kv_heads, head_size/x, block_size, x], not the
+        # flash transposed layout. flashinfer stores kv_cache in flash
+        # layout, so we pass the original (pre-transpose) kv_cache tensor
+        # which has shape [num_blocks, 2, num_kv_heads, head_size/x,
+        # block_size, x] in the HNDM layout. The kernel's reshape_and_cache
+        # path assumes the standard vLLM paged layout, so we rely on the
+        # caller passing the right cache tensor via the attention context.
+        # Here kv_cache is the flash-layout tensor; the kernel needs the
+        # untransposed K and V slices. We pass k_cache/v_cache directly.
+        import vllm._custom_ops as ops
+
+        ops.fused_qwen35_qknorm_rope_kv_insert(
+            q_out,
+            gate_out,
+            qkv,
+            k_out,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            layer_slot_mapping,
+            k_cache,
+            v_cache,
+            rms_norm_eps,
+            kv_cache_dtype_code,
+            layer._k_scale_float,
+            layer._v_scale_float,
+        )
+
 
 def fast_plan_decode(
     self,  # decode wrapper
