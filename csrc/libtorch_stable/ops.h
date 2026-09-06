@@ -262,6 +262,18 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
                         torch::stable::Tensor& position_ids,
                         int64_t forced_token_heads_per_warp);
 
+// Fused Q/K GemmaRMSNorm + partial interleaved MRoPE + gate copy + paged
+// KV-cache insert for Qwen3.8-27B full_attention layers. CUDA-only.
+// See csrc/libtorch_stable/fused_qwen35_qknorm_rope_kv_insert_kernel.cu.
+void fused_qwen35_qknorm_rope_kv_insert(
+    torch::stable::Tensor& q_out, torch::stable::Tensor& gate_out,
+    torch::stable::Tensor& qkv, torch::stable::Tensor& k_out,
+    torch::stable::Tensor& q_weight, torch::stable::Tensor& k_weight,
+    torch::stable::Tensor& cos_sin_cache, torch::stable::Tensor& positions,
+    torch::stable::Tensor& slot_mapping, torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& value_cache, double eps, int64_t kv_cache_dtype,
+    torch::stable::Tensor& k_scale, torch::stable::Tensor& v_scale);
+
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,

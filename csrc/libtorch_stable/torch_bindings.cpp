@@ -428,6 +428,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool is_neox, Tensor position_ids, "
       "int forced_token_heads_per_warp=-1) -> ()");
 
+  // Fused Q/K GemmaRMSNorm + partial interleaved MRoPE + gate copy + paged
+  // KV-cache insert for Qwen3.8-27B full_attention layers (CUDA-only).
+  // Mutates: q_out, gate_out, k_out, key_cache, value_cache.
+  ops.def(
+      "fused_qwen35_qknorm_rope_kv_insert("
+      "Tensor! q_out, Tensor! gate_out, Tensor qkv, Tensor! k_out, "
+      "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
+      "Tensor positions, Tensor slot_mapping, Tensor! key_cache, "
+      "Tensor! value_cache, float eps, int kv_cache_dtype, "
+      "Tensor k_scale, Tensor v_scale) -> ()");
+
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
@@ -791,6 +802,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // Positional encoding kernels (shared CUDA/ROCm)
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
+  ops.impl("fused_qwen35_qknorm_rope_kv_insert",
+           TORCH_BOX(&fused_qwen35_qknorm_rope_kv_insert));
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
   ops.impl(
