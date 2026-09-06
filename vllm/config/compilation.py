@@ -152,6 +152,14 @@ class PassConfig:
     for layers that support it. Auto-enabled at O1+ on ROCm for models
     with QK-norm (e.g. Qwen3-MoE)."""
 
+    fuse_qwen35_qknorm_rope_kvcache: bool = Field(default=None)  # type: ignore[assignment]
+    """Fuse Q/K GemmaRMSNorm + partial interleaved MRoPE + gate copy +
+    paged KV-cache insert into a single CUDA kernel for Qwen3.5-family
+    full_attention layers (e.g. Qwen3.8-27B). CUDA-only (sm80+).
+    Supersedes enable_qk_norm_rope_fusion for Qwen3.5 full_attention
+    layers that support it. Off by default; auto-enabled at O1+ on CUDA
+    sm90/sm100 for Qwen3.5 models with attn_output_gate."""
+
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
     Larger batch sizes e.g. during prefill will use the unfused kernels.
@@ -237,6 +245,7 @@ class PassConfig:
         "fuse_qk_norm_rope_kvcache",
         "enable_qk_norm_rope_fusion",
         "fuse_rope_kvcache_cat_mla",
+        "fuse_qwen35_qknorm_rope_kvcache",
         mode="wrap",
     )
     @classmethod
@@ -302,6 +311,12 @@ class PassConfig:
                 "The fusion will be disabled."
             )
             self.fuse_qk_norm_rope_kvcache = False
+        if self.fuse_qwen35_qknorm_rope_kvcache and not current_platform.is_cuda():
+            logger.warning_once(
+                "Qwen3.5 QK-Norm+RoPE+KVCache fusion requires CUDA (sm80+). "
+                "The fusion will be disabled."
+            )
+            self.fuse_qwen35_qknorm_rope_kvcache = False
         if self.fuse_rope_kvcache_cat_mla and not current_platform.is_cuda_alike():
             logger.warning_once(
                 "MLA KV cache update with RoPE fusion enabled but the "
@@ -976,6 +991,12 @@ class CompilationConfig:
 
         if (
             self.pass_config.fuse_qk_norm_rope_kvcache
+            and "+rotary_embedding" not in self.custom_ops
+        ):
+            self.custom_ops.append("+rotary_embedding")
+
+        if (
+            self.pass_config.fuse_qwen35_qknorm_rope_kvcache
             and "+rotary_embedding" not in self.custom_ops
         ):
             self.custom_ops.append("+rotary_embedding")

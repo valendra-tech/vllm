@@ -964,6 +964,38 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         raise NotImplementedError
 
+    def fused_qwen35_qknorm_rope_kvcache_supported(self):
+        """
+        Does this attention implementation support the Qwen3.5 fused
+        QK-norm + partial MRoPE + gate copy + KV-cache insert kernel
+        (CUDA-only, Qwen3.8-27B full_attention layers).
+        """
+        return False
+
+    def do_qwen35_qknorm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        gate_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        """
+        If `fused_qwen35_qknorm_rope_kvcache_supported` returns True, this
+        method is called by the fused custom op. Applies Q/K GemmaRMSNorm +
+        partial interleaved MRoPE + gate copy, writes q_out/gate_out/k_out,
+        and inserts K (post-RoPE) and V into the paged KV cache. Layout of
+        qkv is [q_gate | k | v] where q_gate packs [q | gate] per head.
+        """
+        raise NotImplementedError
+
     def do_rope_and_kv_cache_update(
         self,
         layer: AttentionLayer,

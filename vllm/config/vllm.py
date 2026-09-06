@@ -240,6 +240,48 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+def enable_qwen35_qknorm_rope_kvcache(cfg: "VllmConfig") -> bool:
+    """Enable fused Qwen3.5 QK-norm + RoPE + KV-cache insert on CUDA.
+
+    Auto-enables at O2+ on CUDA sm90/sm100 for Qwen3.5-family models
+    (model_type qwen3_5_text or qwen3_5_moe_text) that use
+    attn_output_gate, since the fused kernel covers the full_attention
+    layers' gated pre-attention path. The kernel is CUDA-only and off
+    by default until benchmarked faster than the unfused path on a given
+    architecture, so this only returns True when the platform and model
+    match.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:  # sm90+ (Hopper/Blackwell)
+        return False
+    model_config = cfg.model_config
+    if model_config is None or model_config.hf_config is None:
+        return False
+    model_type = getattr(model_config.hf_config, "model_type", "") or ""
+    # Qwen3.8-27B text config is qwen3_5_text; MoE variant is qwen3_5_moe_text.
+    # The vision wrapper is qwen3_5 (handled via text_config), so also accept
+    # the top-level model_type and inspect text_config when present.
+    if model_type not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
+        text_cfg = getattr(model_config.hf_config, "text_config", None)
+        if text_cfg is not None:
+            model_type = getattr(text_cfg, "model_type", "") or ""
+        if model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
+            return False
+    # Only enable when the attention path is the gated one the kernel targets.
+    text_cfg = getattr(model_config.hf_config, "text_config", None)
+    if text_cfg is not None:
+        if not getattr(text_cfg, "attn_output_gate", False):
+            return False
+    else:
+        if not getattr(model_config.hf_config, "attn_output_gate", False):
+            return False
+    return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -255,6 +297,7 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_qwen35_qknorm_rope_kvcache": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
         "use_inductor_graph_partition": False,
@@ -278,6 +321,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_qwen35_qknorm_rope_kvcache": False,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -301,6 +345,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_qwen35_qknorm_rope_kvcache": enable_qwen35_qknorm_rope_kvcache,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -324,6 +369,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_qwen35_qknorm_rope_kvcache": enable_qwen35_qknorm_rope_kvcache,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
