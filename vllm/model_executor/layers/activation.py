@@ -155,6 +155,49 @@ class SiluAndMul(CustomOp):
         return self.forward_native(x)
 
 
+@CustomOp.register("sigmoid_and_mul")
+class SigmoidAndMul(CustomOp):
+    """Gated sigmoid activation used by Qwen3.5 attn_output_gate.
+
+    Computes x -> sigmoid(x[:d]) * x[d:] where d = x.shape[-1] // 2.
+    This fuses the separate ``torch.sigmoid(gate)`` and elementwise multiply
+    into a single kernel launch.
+
+    Shapes:
+        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
+        return: (num_tokens, d) or (batch_size, seq_len, d)
+    """
+
+    def __init__(self, *, compile_native: bool = True):
+        super().__init__(compile_native=compile_native)
+        if (
+            current_platform.is_cuda_alike()
+            or current_platform.is_cpu()
+            or current_platform.is_xpu()
+        ):
+            self.op = torch.ops._C.sigmoid_and_mul
+
+    @staticmethod
+    def forward_native(x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        return torch.sigmoid(x[..., :d]) * x[..., d:]
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC:
+            return self.forward_cuda(x)
+        return self.forward_native(x)
+
+
 @CustomOp.register("situ_and_mul")
 class SituAndMul(CustomOp):
     """SituGLU activation used by Kimi models.

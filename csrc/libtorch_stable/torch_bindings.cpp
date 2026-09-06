@@ -584,6 +584,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Activation function used in SwiGLU.
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
 
+  // sigmoid(gate) * up — used by Qwen3.5 attn_output_gate fusion.
+  ops.def("sigmoid_and_mul(Tensor! result, Tensor input) -> ()");
+
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
 
   // SwiGLU activation with input clamping.
@@ -849,6 +852,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
   ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
+  ops.impl("sigmoid_and_mul", TORCH_BOX(&sigmoid_and_mul));
   ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
   ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
   ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));

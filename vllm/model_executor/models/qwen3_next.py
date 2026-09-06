@@ -18,6 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.activation import SigmoidAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -381,6 +382,14 @@ class Qwen3NextAttention(nn.Module):
             and (text_only or supports_mrope)
         )
 
+        # Fused sigmoid(gate) * attn_output into a single kernel launch.
+        # Replaces the separate torch.sigmoid + elementwise mul with
+        # SigmoidAndMul (out = sigmoid(x[:d]) * x[d:]).
+        if self.attn_output_gate:
+            self.sigmoid_and_mul = SigmoidAndMul()
+        else:
+            self.sigmoid_and_mul = None
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -452,7 +461,14 @@ class Qwen3NextAttention(nn.Module):
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
-            attn_output = attn_output * torch.sigmoid(gate)
+            if self.sigmoid_and_mul is not None:
+                # Fuse sigmoid(gate) * attn_output into one kernel.
+                # SigmoidAndMul expects [gate | up] packed on the last dim.
+                attn_output = self.sigmoid_and_mul(
+                    torch.cat([gate, attn_output], dim=-1)
+                )
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
         return output
 

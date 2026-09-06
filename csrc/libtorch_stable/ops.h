@@ -511,6 +511,10 @@ void silu_and_mul_clamp(torch::stable::Tensor& out,
                         torch::stable::Tensor& input, double limit,
                         double alpha = 1.0, double beta = 0.0);
 
+// out = sigmoid(input[:d]) * input[d:] — used by Qwen3.5 attn_output_gate
+// (output_gate_type=swish) to fuse the sigmoid(gate) * attn_output step.
+void sigmoid_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
+
 void silu_and_mul_quant(torch::stable::Tensor& out,
                         torch::stable::Tensor& input,
                         torch::stable::Tensor& scale);
