@@ -178,6 +178,22 @@ __device__ __forceinline__ packed_t packed_silu_kernel(const packed_t& val,
 }
 
 template <typename T>
+__device__ __forceinline__ T sigmoid_kernel(const T& x, const float alpha) {
+  // sigmoid(alpha * x)
+  return (T)(1.0f / (1.0f + expf((float)-x * alpha)));
+}
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t packed_sigmoid_kernel(const packed_t& val,
+                                                          const float alpha) {
+  // sigmoid(alpha * x)
+  float2 fval = cast_to_float2(val);
+  fval.x = 1.0f / (1.0f + expf(-fval.x * alpha));
+  fval.y = 1.0f / (1.0f + expf(-fval.y * alpha));
+  return cast_to_packed<packed_t>(fval);
+}
+
+template <typename T>
 __device__ __forceinline__ T gelu_kernel(const T& x, const float /*alpha*/) {
   // Equivalent to PyTorch GELU with 'none' approximation.
   // Refer to:
@@ -301,6 +317,15 @@ void silu_and_mul(torch::stable::Tensor& out,    // [..., d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
                                 true, false, 0.0f, 1.0f, 0.0f);
+}
+
+void sigmoid_and_mul(torch::stable::Tensor& out,    // [..., d]
+                     torch::stable::Tensor& input)  // [..., 2 * d]
+{
+  // out = sigmoid(input[:d]) * input[d:]
+  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::sigmoid_kernel,
+                                vllm::packed_sigmoid_kernel, true, false,
+                                0.0f, 1.0f, 0.0f);
 }
 
 void silu_and_mul_clamp(torch::stable::Tensor& out,    // [..., d]

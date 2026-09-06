@@ -500,6 +500,12 @@ def rms_norm_per_block_quant(
     return output, scales
 
 
+# fused sigmoid_and_mul — used by Qwen3.5 attn_output_gate fusion.
+# out = sigmoid(input[:d]) * input[d:]
+def sigmoid_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+    torch.ops._C.sigmoid_and_mul(out, input)
+
+
 # fused silu_and_mul + block quant
 def silu_and_mul_per_block_quant(
     input: torch.Tensor,
