@@ -135,7 +135,7 @@ def convert_ternary(reader, info, hf_name, out):
     trits, d = decode_pq2_tensor_trits(reader, info)
     qs, scale = encode_ternary_hf(trits, d)
     out[hf_name] = torch.from_numpy(qs)
-    out[hf_name + ".scale"] = torch.from_numpy(scale)
+    out[hf_name + "_scale"] = torch.from_numpy(scale)
 
 
 def convert_f32(reader, info, hf_name, out):
@@ -190,18 +190,20 @@ def build_config(reader):
     vocab_size = [t for t in reader.tensors if t.name == "token_embd.weight"][0].dims[1]
     return {
         "architectures": ["Bonsai2ForCausalLM"],
-        "model_type": "bonsai2",
-        "quant_method": "bonsai_ternary",
-        "ternary_target": "auto",
-        "hadamard_block": reader.get_i32("prism.hadamard.block_size"),
-        "hadamard_version": reader.get_i32("prism.hadamard.version"),
-        "hadamard_transform": reader.get_str("prism.hadamard.transform"),
-        "hadamard_axis": reader.get_str("prism.hadamard.axis"),
-        "hadamard_sign_mode": reader.get_str("prism.hadamard.sign_mode"),
-        "hadamard_signs": signs,
-        "hadamard_folded": folded,
-        "hadamard_inverse": inverse,
-        "gdn_v_grouped": bool(reader.kv.get("prism.hadamard.gdn_v_grouped", 0)),
+        "model_type": "qwen3_5_text",
+        "quantization_config": {
+            "quant_method": "bonsai_ternary",
+            "ternary_target": "auto",
+            "hadamard_block": reader.get_i32("prism.hadamard.block_size"),
+            "hadamard_version": reader.get_i32("prism.hadamard.version"),
+            "hadamard_transform": reader.get_str("prism.hadamard.transform"),
+            "hadamard_axis": reader.get_str("prism.hadamard.axis"),
+            "hadamard_sign_mode": reader.get_str("prism.hadamard.sign_mode"),
+            "hadamard_signs": signs,
+            "hadamard_folded": folded,
+            "hadamard_inverse": inverse,
+            "gdn_v_grouped": bool(reader.kv.get("prism.hadamard.gdn_v_grouped", 0)),
+        },
         "hidden_size": reader.get_i32("qwen35.embedding_length"),
         "intermediate_size": reader.get_i32("qwen35.feed_forward_length"),
         "num_hidden_layers": n_layers,
@@ -209,27 +211,35 @@ def build_config(reader):
         "num_key_value_heads": reader.get_i32("qwen35.attention.head_count_kv"),
         "head_dim": reader.get_i32("qwen35.attention.key_length"),
         "vocab_size": int(vocab_size),
-        "rope_theta": reader.get_f32("qwen35.rope.freq_base"),
         "rms_norm_eps": 1e-06,
-        "rotary_dim": reader.get_i32("qwen35.rope.dimension_count"),
-        "rope_sections": sections[:3],
         "max_position_embeddings": reader.get_i32("qwen35.context_length"),
         "full_attention_interval": interval,
         "attn_output_gate": True,
         "output_gate_type": "swish",
-        "linear_attn_config": {
-            "num_key_heads": reader.get_i32("qwen35.ssm.group_count"),
-            "num_value_heads": reader.get_i32("qwen35.ssm.time_step_rank"),
-            "key_head_dim": ssm_state,
-            "value_head_dim": ssm_state,
-            "conv_kernel": reader.get_i32("qwen35.ssm.conv_kernel"),
-            "state_size": ssm_state,
-            "group_count": reader.get_i32("qwen35.ssm.group_count"),
-            "time_step_rank": reader.get_i32("qwen35.ssm.time_step_rank"),
-            "inner_size": reader.get_i32("qwen35.ssm.inner_size"),
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "hidden_act": "silu",
+        "initializer_range": 0.02,
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": sections[:3],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": reader.get_f32("qwen35.rope.freq_base"),
         },
+        "linear_num_key_heads": reader.get_i32("qwen35.ssm.group_count"),
+        "linear_num_value_heads": reader.get_i32("qwen35.ssm.time_step_rank"),
+        "linear_key_head_dim": ssm_state,
+        "linear_value_head_dim": ssm_state,
+        "linear_conv_kernel_dim": reader.get_i32("qwen35.ssm.conv_kernel"),
+        "mamba_ssm_dtype": "float32",
         "layer_types": layer_types,
         "torch_dtype": "bfloat16",
+        "bos_token_id": reader.get_i32("tokenizer.ggml.bos_token_id"),
+        "eos_token_id": reader.get_i32("tokenizer.ggml.eos_token_id"),
+        "pad_token_id": reader.get_i32("tokenizer.ggml.padding_token_id"),
     }
 
 
@@ -302,7 +312,7 @@ def main():
         json.dump(cfg, f, indent=2)
     with open(os.path.join(args.out, "generation_config.json"), "w") as f:
         json.dump(GENERATION_CONFIG, f, indent=2)
-    print(f"[save] config.json + generation_config.json written ({len(cfg['hadamard_folded'])} folded names)")
+    print(f"[save] config.json + generation_config.json written ({len(cfg['quantization_config']['hadamard_folded'])} folded names)")
 
     export_tokenizer(reader, args.out)
     print(f"[done] model.safetensors {st_bytes} bytes in {time.time() - t_start:.1f}s")

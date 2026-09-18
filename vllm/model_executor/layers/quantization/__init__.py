@@ -36,6 +36,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
+    "bonsai_ternary",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -132,6 +133,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         deepseek_config = DeepseekV4FP8Config
 
     from .auto_awq import AutoAWQConfig
+    from .bonsai_ternary import BonsaiTernaryQuantConfig
     from .auto_gptq import AutoGPTQConfig
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -177,6 +179,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": deepseek_config,
         "humming": HummingConfig,
+        "bonsai_ternary": BonsaiTernaryQuantConfig,
         "online": OnlineQuantizationConfig,
         # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
         # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
