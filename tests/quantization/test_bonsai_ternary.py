@@ -42,3 +42,27 @@ def test_hadamard_matrix_matches_fork():
     par ^= par >> 16; par ^= par >> 8; par ^= par >> 4; par ^= par >> 2; par ^= par >> 1
     assert H[i, j] == (-s if par & 1 else s)
     assert np.allclose(H @ H.T, np.eye(1024), atol=1e-5)
+
+GGUF_PATH = "/dev/shm/bonsai-pq2.gguf"
+
+def test_gguf_reader_metadata_and_dir():
+    import os
+    if not os.path.exists(GGUF_PATH):
+        pytest.skip("GGUF not present on this machine")
+    from gguf_reader_min import GgufMinReader
+    r = GgufMinReader(GGUF_PATH)
+    assert r.get_str("general.architecture") == "qwen35"
+    assert r.get_i32("qwen35.block_count") == 64
+    assert r.get_i32("prism.hadamard.block_size") == 1024
+    assert r.get_str("prism.hadamard.transform") == "normalized-sylvester-walsh-hadamard"
+    assert r.get_str("prism.hadamard.axis") == "input-last-dimension"
+    assert r.get_str("prism.hadamard.sign_mode") == "explicit"
+    assert r.get_strs("prism.hadamard.inverse_weight_names") == ["token_embd.weight"]
+    assert r.get_i32s("prism.hadamard.sign_widths") == [5120, 6144, 17408]
+    assert len(r.get_i32s("prism.hadamard.sign_values")) == 5120 + 6144 + 17408
+    assert len(r.tensors) == 851
+    by = {t.name: t for t in r.tensors}
+    assert by["output.weight"].dims == (5120, 248320) and by["output.weight"].ggml_type == 142
+    assert by["blk.0.attn_qkv.weight"].dims == (5120, 10240)
+    assert by["blk.0.ssm_out.weight"].dims == (6144, 5120)
+    assert by["output_norm.weight"].ggml_type == 0
