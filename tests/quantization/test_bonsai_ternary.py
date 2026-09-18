@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import pytest
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
@@ -199,3 +200,87 @@ def test_converter_build_config_structure():
     assert cfg["gdn_v_grouped"] is True
     assert cfg["torch_dtype"] == "bfloat16"
     assert cfg["attn_output_gate"] is True and cfg["output_gate_type"] == "swish"
+
+# ---------------------------------------------------------------------------
+# BonsaiTernaryLinearMethod (Task 7)
+# ---------------------------------------------------------------------------
+
+def _pack_q2b1(trits: torch.Tensor) -> torch.Tensor:
+    # trits (N, K) int {-1,0,1} -> (N, K//4) uint8 LSB-first, per byte 4 slots
+    codes = torch.tensor([2, 0, 1], device=trits.device)[(trits + 1)]
+    N, K = trits.shape
+    packed = torch.zeros(N, K // 4, dtype=torch.uint8, device=trits.device)
+    for j in range(4):
+        packed |= codes[:, j::4].to(torch.uint8) << (2 * j)
+    return packed
+
+
+def test_bonsai_ternary_linear_fp8_end_to_end():
+    import torch
+    from prism_pq2 import hadamard_matrix
+    if not torch.cuda.is_available():
+        pytest.skip("cuda")
+    from vllm.model_executor.layers.quantization.bonsai_ternary import (
+        BonsaiTernaryConfig, BonsaiTernaryLinearMethod)
+    torch.manual_seed(0)
+    K, N, M = 1024, 512, 3
+    trits = torch.randint(-1, 2, (N, K), device="cuda")
+    packed = _pack_q2b1(trits)
+    scale = (torch.rand(N, K // 128, device="cuda") + 0.5).to(torch.float16)
+    signs = torch.tensor([-1.0, 1.0] * 512, device="cuda")
+    lm = BonsaiTernaryLinearMethod(BonsaiTernaryConfig(ternary_target="fp8"), K, N)
+    lm.process_weights_after_loading({"packed": packed, "scale": scale}, signs, "cuda:0")
+    # memory check (small shapes): fp8 weights + fp32 grouped scales
+    assert lm.weight_bytes() == K * N * 1 + N * (K // 128) * 4
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    out = lm.apply(x)
+    H = torch.from_numpy(hadamard_matrix(1024)).to("cuda")
+    w_dq = (trits.float() * scale.float().repeat_interleave(128, dim=1)).double()
+    xh = ((x.float() * signs) @ H.T).double()
+    ref = xh @ w_dq.T
+    # fp8 e4m3 grouped quantization of the activations has ~4% relative
+    # noise per element; the resulting output noise (~0.026 * ref std, i.e.
+    # ~0.7 abs for this shape) is independent of |ref|, so atol must cover
+    # it. Measured need up to 2.4 across seeds -> 2.5.
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0.15, atol=2.5)
+
+
+def test_bonsai_ternary_linear_int4_exactish():
+    import torch
+    from prism_pq2 import hadamard_matrix
+    if not torch.cuda.is_available():
+        pytest.skip("cuda")
+    from vllm.model_executor.layers.quantization.bonsai_ternary import (
+        BonsaiTernaryConfig, BonsaiTernaryLinearMethod)
+    torch.manual_seed(1)
+    K, N, M = 2048, 256, 2
+    trits = torch.randint(-1, 2, (N, K), device="cuda")
+    packed = _pack_q2b1(trits)
+    scale = (torch.rand(N, K // 128, device="cuda") + 0.5).to(torch.float16)
+    signs = torch.tensor([-1.0, 1.0] * 1024, device="cuda")
+    lm = BonsaiTernaryLinearMethod(BonsaiTernaryConfig(ternary_target="int4"), K, N)
+    lm.process_weights_after_loading({"packed": packed, "scale": scale}, signs, "cuda:0")
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    out = lm.apply(x)
+    H = torch.from_numpy(hadamard_matrix(1024)).to("cuda")
+    # block-hadamard: H + signs applied per 1024-block
+    xh = torch.empty_like(x, dtype=torch.float64)
+    for b in range(K // 1024):
+        xb = x.double()[:, b*1024:(b+1)*1024] * signs[b*1024:(b+1)*1024].double()
+        xh[:, b*1024:(b+1)*1024] = xb @ torch.from_numpy(hadamard_matrix(1024)).double().to("cuda").T
+    w_dq = trits.double() * scale.double().repeat_interleave(128, dim=1)
+    ref = xh @ w_dq.T
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0.05, atol=0.2)
+
+
+def test_bonsai_ternary_auto_blackwell():
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("cuda")
+    from vllm.model_executor.layers.quantization.bonsai_ternary import BonsaiTernaryConfig
+    cfg = BonsaiTernaryConfig(ternary_target="auto")
+    if torch.cuda.get_device_capability()[0] >= 12:
+        assert cfg.resolve() == "nvfp4"
+    else:
+        assert cfg.resolve() == "int4"
+    assert BonsaiTernaryConfig(ternary_target="int4").resolve() == "int4"
