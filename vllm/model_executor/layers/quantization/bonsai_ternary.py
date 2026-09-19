@@ -480,10 +480,28 @@ class BonsaiTernaryQuantConfig(QuantizationConfig):
             int(k): torch.tensor(v, dtype=torch.float32)
             for k, v in (hadamard_signs or {}).items()
         }
-        self.hadamard_folded = {
+        folded = {
             n[: -len(".weight")] if n.endswith(".weight") else n
             for n in (hadamard_folded or [])
         }
+        # vLLM fuses q/k/v -> qkv_proj, gate/up -> gate_up_proj and the GDN
+        # in_proj_qkv + in_proj_z -> in_proj_qkvz at module level; the
+        # checkpoint keeps them separate, so mirror the folded set onto the
+        # fused module prefixes.
+        fused_aliases = {
+            ".q_proj": ".qkv_proj",
+            ".k_proj": ".qkv_proj",
+            ".v_proj": ".qkv_proj",
+            ".gate_proj": ".gate_up_proj",
+            ".up_proj": ".gate_up_proj",
+            ".in_proj_qkv": ".in_proj_qkvz",
+            ".in_proj_z": ".in_proj_qkvz",
+        }
+        for name in list(folded):
+            for src, dst in fused_aliases.items():
+                if name.endswith(src):
+                    folded.add(name[: -len(src)] + dst)
+        self.hadamard_folded = folded
         self.hadamard_inverse = {
             n[: -len(".weight")] if n.endswith(".weight") else n
             for n in (hadamard_inverse or [])

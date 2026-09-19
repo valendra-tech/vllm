@@ -136,12 +136,17 @@ def _make_tiny_model(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config))
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
-    tok.train_from_iterator(["hello world this is a tiny test corpus " * 50], vocab_size=VOCAB)
+    trainer = trainers.BpeTrainer(
+        vocab_size=VOCAB, special_tokens=["<pad>", "<bos>", "<eos>"]
+    )
+    tok.train_from_iterator(
+        ["hello world this is a tiny test corpus " * 50], trainer=trainer
+    )
     tok.save(str(tmp_path / "tokenizer.json"))
     return tmp_path
 
