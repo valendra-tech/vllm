@@ -25,11 +25,22 @@ Hadamard rotation: y = (x*signs @ H^T) @ W^T where H is the normalized
 the signs+FWHT is applied per 1024-block (each block of x uses its own slice
 of signs), matching the block-diagonal rotation of the checkpoint format.
 """
+import os
+from contextlib import suppress
 from typing import Dict, List, Optional
 
 import torch
 
-from .bonsai_decode import decode_trits
+from .bonsai_decode import (
+    BonsaiQ2b1UnavailableError,
+    _decode_trits_fallback,
+    _is_current_stream_capturing,
+    _load_ext,
+    _make_lut,
+    decode_trits,
+    prewarm_q2b1_autotune,
+    q2b1_gemm_autotuned,
+)
 from .hadamard_fwht import fwht_signs, fwht_signs_quant_fp8
 
 _HADAMARD_BLOCK = 1024
@@ -552,19 +563,14 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
     """Packed ternary linear with the offline-folded Hadamard rotation.
 
     Checkpoint tensors: <prefix>.weight (uint8 Q2b1, (N, K//4)) and
-    <prefix>.weight_scale (fp16, (N, K//128)).  After loading, the
-    exact trits are repacked to 2-per-byte nibbles plus fp32 grouped scales
-    (resident weights stay at ~0.5 B/param; never expanded to FP16).
+    <prefix>.weight_scale (fp16, (N, K//128)).  After loading, these raw
+    tensors remain resident and are decoded only for requested fallback rows.
     """
 
     def __init__(self, quant_config: BonsaiTernaryQuantConfig, prefix: str):
         self.quant_config = quant_config
         self.prefix = prefix
         self.is_inverse = prefix in quant_config.hadamard_inverse
-        self.is_gdn_out = (
-            quant_config.gdn_v_grouped
-            and prefix.endswith(".linear_attn.out_proj")
-        )
         self.signs: Optional[torch.Tensor] = None
 
     def create_weights(
@@ -577,86 +583,163 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-        )
-
         in_features = input_size_per_partition
         out_features = sum(output_partition_sizes)
-        signs = self.quant_config.hadamard_signs.get(in_features)
-        if signs is None:
+        global_signs = self.quant_config.hadamard_signs.get(input_size)
+        if global_signs is None and input_size == in_features:
+            global_signs = self.quant_config.hadamard_signs.get(in_features)
+        if global_signs is None:
             raise ValueError(
-                f"no Hadamard signs for input width {in_features} ({self.prefix})"
+                f"no Hadamard signs for input width {input_size} ({self.prefix})"
             )
+        if input_size == in_features:
+            signs = global_signs
+        else:
+            tp_rank = int(getattr(layer, "tp_rank", 0))
+            start = tp_rank * in_features
+            stop = start + in_features
+            if len(global_signs) != input_size or stop > len(global_signs):
+                raise ValueError(
+                    f"invalid Hadamard signs for TP shard {tp_rank}: "
+                    f"global width {input_size}, local width {in_features}"
+                )
+            signs = global_signs[start:stop].contiguous()
         self.signs = signs
 
-        is_vocab = isinstance(layer, VocabParallelEmbedding)
         weight_loader = extra_weight_attrs.get("weight_loader")
+        # Standard (out, in) orientation: PQ2_0's 128-weight groups run
+        # along the input dim and each checkpoint row is an output feature.
         base_attrs: Dict[str, object] = {"input_dim": 1, "output_dim": 0}
-        # Fused linear loaders need their shard-aware loader; vocab layers at
-        # TP=1 load the full tensor with the default loader (their own loader
-        # assumes the unquantized shapes).
-        if weight_loader is not None and not is_vocab:
+        # Linear and vocab layers both need their shard-aware loader so packed
+        # rows are sliced on the logical output dimension.
+        if weight_loader is not None:
             base_attrs["weight_loader"] = weight_loader
 
+        # The checkpoint packs the input dimension: 4 trits per byte and one
+        # fp16 scale per 128 input values. Keep output offsets logical so
+        # merged q/k/v/z loaders populate every output row.
         packed = Parameter(
             torch.empty(out_features, in_features // 4, dtype=torch.uint8),
             requires_grad=False,
         )
-        set_weight_attrs(packed, dict(base_attrs))
+        layer.register_buffer(
+            "_bonsai_signs", signs.to(packed.device), persistent=False
+        )
+        set_weight_attrs(
+            packed, dict(base_attrs, packed_dim=1, packed_factor=4)
+        )
         layer.register_parameter("weight", packed)
 
         scale = Parameter(
             torch.empty(out_features, in_features // 128, dtype=torch.float16),
             requires_grad=False,
         )
-        set_weight_attrs(scale, dict(base_attrs))
+        set_weight_attrs(
+            scale, dict(base_attrs, packed_dim=1, packed_factor=128)
+        )
         layer.register_parameter("weight_scale", scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        packed = layer.weight.data
-        scale = layer.weight_scale.data
-        out_features, k4 = packed.shape
-        in_features = k4 * 4
-        trits = decode_trits(packed.reshape(-1)).reshape(
-            out_features, k4, 4
-        ).reshape(out_features, in_features)
-        # {-1,0,+1} -> {0,1,2}, two per byte (low nibble = even index).
-        t = trits.to(torch.uint8) + 1
-        nibbles = (t[:, 0::2] | (t[:, 1::2] << 4)).contiguous()
+        packed = layer.weight.data.contiguous()
+        scale = layer.weight_scale.data.contiguous()
+        prewarm_m_values = (
+            (1, 2, 4, 8, 16, 32, 64)
+            if os.getenv("BONSAI_FUSED_GEMM_M64") == "1"
+            else (1, 2, 4, 8, 16, 32)
+        )
+        if packed.is_cuda:
+            try:
+                extension = _load_ext()
+                _make_lut(packed.device)
+                if (
+                    os.getenv("BONSAI_FUSED_GEMM") != "0"
+                    and extension is not None
+                    and not torch.compiler.is_compiling()
+                ):
+                    # Up to seven buckets cost 21 timed candidates per unique N/K shape.
+                    prewarm_q2b1_autotune(
+                        packed, scale, prewarm_m_values
+                    )
+            except BonsaiQ2b1UnavailableError:
+                pass
+        signs = layer._bonsai_signs
+        if signs.device != packed.device:
+            layer._buffers["_bonsai_signs"] = signs.to(packed.device)
         layer.register_parameter("weight", None)
         layer.register_parameter("weight_scale", None)
-        layer._bonsai_nibbles = nibbles
-        layer._bonsai_scales = scale.float().contiguous()
+        layer._bonsai_packed = packed
+        layer._bonsai_scales = scale
 
-    def _dequant(self, layer: torch.nn.Module) -> torch.Tensor:
-        nib = layer._bonsai_nibbles
-        scales = layer._bonsai_scales
-        low = (nib & 0x0F).to(torch.int8)
-        high = ((nib >> 4) & 0x0F).to(torch.int8)
-        n, k2 = nib.shape
-        t = torch.stack((low, high), dim=-1).reshape(n, k2 * 2)
-        trits = t.float() - 1.0
-        w = trits * scales.repeat_interleave(_SCALE_GROUP, dim=-1)
-        return w.to(torch.bfloat16)
+    @staticmethod
+    def _dequant_rows(
+        packed: torch.Tensor, scales: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode a packed row chunk to bf16 (bounded memory).
 
-    def _rotate(self, x: torch.Tensor) -> torch.Tensor:
+        packed: (m, K//4) uint8, scales: (m, K//128) fp16 -> (m, K) bf16.
+        """
+        m, k4 = packed.shape
+        trits: Optional[torch.Tensor] = None
+        if packed.device.type != "cpu":
+            with suppress(BonsaiQ2b1UnavailableError):
+                trits = (
+                    decode_trits(packed.reshape(-1))
+                    .reshape(m, k4, 4)
+                    .reshape(m, k4 * 4)
+                )
+        if trits is None:
+            trits = _decode_trits_fallback(packed.reshape(-1)).reshape(m, k4 * 4)
+        return (
+            trits.float() * scales.float().repeat_interleave(_SCALE_GROUP, dim=-1)
+        ).to(torch.bfloat16)
+
+    _APPLY_ROW_CHUNK = 16384  # bounds dequantized output-row transients
+
+    def _resolve_signs(
+        self, x: torch.Tensor, signs: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        signs = self.signs if signs is None else signs
+        assert signs is not None
+        if signs.device != x.device:
+            if x.is_cuda and _is_current_stream_capturing():
+                raise RuntimeError(
+                    "Bonsai Hadamard signs must be moved to the device "
+                    "before CUDA graph capture"
+                )
+            signs = signs.to(x.device)
+        return signs
+
+    def _layer_signs(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> torch.Tensor:
+        signs = getattr(layer, "_bonsai_signs", self.signs)
+        if signs is None:
+            raise RuntimeError("Bonsai Hadamard signs are not initialized")
+        if signs.device != x.device:
+            if x.is_cuda and _is_current_stream_capturing():
+                raise RuntimeError(
+                    "Bonsai Hadamard signs must be moved to the device "
+                    "before CUDA graph capture"
+                )
+            signs = signs.to(x.device)
+            if "_bonsai_signs" in layer._buffers:
+                layer._buffers["_bonsai_signs"] = signs
+        return signs
+
+    def _rotate(
+        self, x: torch.Tensor, signs: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Forward activation transform: y = H @ (signs * x) per block."""
-        assert self.signs is not None
+        signs = self._resolve_signs(x, signs)
         k = x.shape[-1]
-        if self.is_gdn_out:
-            # GDN head regroup [hd=128, nk=16, rep=3] -> [hd, rep, nk]
-            # (mirrors llama.cpp prism.hadamard gdn_v_grouped).
-            assert k == 6144, f"gdn_v_grouped expects inner size 6144, got {k}"
-            m = x.shape[0]
-            x = x.view(m, 128, 16, 3).permute(0, 1, 3, 2).contiguous().view(m, k)
         x = x.float()
+        # The converter already places GDN heads in the vLLM target order.
+        # Reordering the output activation here would apply the permutation a
+        # second time before the folded Hadamard transform.
         nb = k // _HADAMARD_BLOCK
         outs = []
         for b in range(nb):
-            s = self.signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK].to(
-                x.device
-            )
+            s = signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK]
             outs.append(
                 fwht_signs(x[:, b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK], s)
             )
@@ -668,40 +751,81 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        xh = self._rotate(x).to(torch.bfloat16)
-        w = self._dequant(layer)
-        out = xh @ w.t()
+        # Standard layout: y = x @ W.T with W (out, in).
+        xh = self._rotate(x, self._layer_signs(layer, x)).float()
+        packed = layer._bonsai_packed
+        scales = layer._bonsai_scales
+        m64_enabled = os.getenv("BONSAI_FUSED_GEMM_M64") == "1"
+        if (
+            os.getenv("BONSAI_FUSED_GEMM") != "0"
+            and x.is_cuda
+            and x.is_contiguous()
+            and xh.is_cuda
+            and xh.is_contiguous()
+            and packed.is_cuda
+            and packed.is_contiguous()
+            and scales.is_cuda
+            and scales.is_contiguous()
+            and xh.shape[0] <= (64 if m64_enabled else 32)
+            and xh.shape[1] % _SCALE_GROUP == 0
+        ):
+            try:
+                out = q2b1_gemm_autotuned(xh, packed, scales)
+            except BonsaiQ2b1UnavailableError:
+                pass
+            else:
+                if bias is not None:
+                    out = out + bias
+                return out
+
+        n = packed.shape[0]
+        out = torch.empty(
+            (xh.shape[0], n), dtype=torch.bfloat16, device=xh.device
+        )
+        chunk = self._APPLY_ROW_CHUNK
+        for r0 in range(0, n, chunk):
+            r1 = min(r0 + chunk, n)
+            w = self._dequant_rows(
+                packed[r0:r1], scales[r0:r1]
+            )
+            out[:, r0:r1] = (xh @ w.float().transpose(0, 1)).to(torch.bfloat16)
         if bias is not None:
             out = out + bias
         return out
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         idx = input_.long()
-        nib = layer._bonsai_nibbles
-        scales = layer._bonsai_scales
-        rows = nib[idx]
-        low = (rows & 0x0F).to(torch.int8)
-        high = ((rows >> 4) & 0x0F).to(torch.int8)
-        m, k2 = rows.shape
-        t = torch.stack((low, high), dim=-1).reshape(m, k2 * 2)
-        trits = t.float() - 1.0
-        w = trits * scales[idx].repeat_interleave(_SCALE_GROUP, dim=-1)
+        flat_idx = idx.reshape(-1)
+        if flat_idx.numel() == 0:
+            embedding_dim = layer._bonsai_packed.shape[1] * 4
+            return torch.empty(
+                (*idx.shape, embedding_dim),
+                dtype=torch.bfloat16,
+                device=layer._bonsai_packed.device,
+            )
+        x = self._dequant_rows(
+            layer._bonsai_packed[flat_idx],
+            layer._bonsai_scales[flat_idx],
+        )
         if self.is_inverse:
-            return self._inverse_rotate(w.to(torch.bfloat16))
-        return w.to(torch.bfloat16)
+            x = self._inverse_rotate(
+                x, self._layer_signs(layer, x)
+            )
+            return x.reshape(*idx.shape, -1)
+        return x.reshape(*idx.shape, -1)
 
-    def _inverse_rotate(self, x: torch.Tensor) -> torch.Tensor:
+    def _inverse_rotate(
+        self, x: torch.Tensor, signs: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Latent lookup restore: x = signs * (H @ row) per block."""
-        assert self.signs is not None
+        signs = self._resolve_signs(x, signs)
         k = x.shape[-1]
         nb = k // _HADAMARD_BLOCK
         ones = torch.ones(_HADAMARD_BLOCK, device=x.device, dtype=torch.float32)
         outs = []
         for b in range(nb):
             h = fwht_signs(x[:, b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK], ones)
-            s = self.signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK].to(
-                x.device
-            )
+            s = signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK]
             outs.append(h * s)
         y = torch.cat(outs, dim=-1) if nb > 1 else outs[0]
         return y.to(x.dtype)

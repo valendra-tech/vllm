@@ -1123,6 +1123,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "9.0a;10.0f;12.0f" "${CUDA_ARCHS}")
     cuda_archs_loose_intersection(FUSED_GDN_DECODE_ARCHS
       "8.0;8.6;8.9;9.0a;10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+  else()
+    # CUDA 12.8 supports Blackwell's SM120 target directly, but not the
+    # family-specific architecture names introduced in CUDA 12.9.
+    cuda_archs_loose_intersection(FUSED_GDN_DECODE_ARCHS
+      "8.0;8.6;8.9;9.0;10.0;10.1;10.3;12.0;12.1" "${CUDA_ARCHS}")
   endif()
   if(FUSED_KDA_DECODE_ARCHS)
     set(FUSED_KDA_DECODE_SRC

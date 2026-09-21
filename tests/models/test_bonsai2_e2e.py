@@ -33,7 +33,9 @@ def _pack_q2b1(trits: torch.Tensor) -> torch.Tensor:
     return packed
 
 
-def _ternary(out_f: int, in_f: int, gen: torch.Generator):
+def _ternary(in_f: int, out_f: int, gen: torch.Generator):
+    # Standard checkpoint layout: rows are output features and the 128-weight
+    # groups run along the input dim.
     trits = torch.randint(-1, 2, (out_f, in_f), generator=gen)
     return {
         "weight": _pack_q2b1(trits),
@@ -49,27 +51,29 @@ def _make_tiny_model(tmp_path):
         str(HIDDEN): (torch.randint(0, 2, (HIDDEN,), generator=gen) * 2 - 1).tolist(),
         str(INTER): (torch.randint(0, 2, (INTER,), generator=gen) * 2 - 1).tolist(),
     }
+    # (in_features, out_features) semantic shapes; tensors are stored as
+    # (out_features, in_features).
     ternary_specs = {
-        "model.embed_tokens": (VOCAB, HIDDEN),
-        "lm_head": (VOCAB, HIDDEN),
+        "model.embed_tokens": (HIDDEN, VOCAB),
+        "lm_head": (HIDDEN, VOCAB),
     }
     for n in range(2):
         p = f"model.layers.{n}"
         ternary_specs.update(
             {
-                f"{p}.self_attn.q_proj": (HEADS * HEAD_DIM * 2, HIDDEN),
-                f"{p}.self_attn.k_proj": (KV_HEADS * HEAD_DIM, HIDDEN),
-                f"{p}.self_attn.v_proj": (KV_HEADS * HEAD_DIM, HIDDEN),
-                f"{p}.self_attn.o_proj": (HIDDEN, HEADS * HEAD_DIM),
-                f"{p}.mlp.gate_proj": (INTER, HIDDEN),
-                f"{p}.mlp.up_proj": (INTER, HIDDEN),
-                f"{p}.mlp.down_proj": (HIDDEN, INTER),
+                f"{p}.self_attn.q_proj": (HIDDEN, HEADS * HEAD_DIM * 2),
+                f"{p}.self_attn.k_proj": (HIDDEN, KV_HEADS * HEAD_DIM),
+                f"{p}.self_attn.v_proj": (HIDDEN, KV_HEADS * HEAD_DIM),
+                f"{p}.self_attn.o_proj": (HEADS * HEAD_DIM, HIDDEN),
+                f"{p}.mlp.gate_proj": (HIDDEN, INTER),
+                f"{p}.mlp.up_proj": (HIDDEN, INTER),
+                f"{p}.mlp.down_proj": (INTER, HIDDEN),
             }
         )
 
     tensors = {}
-    for name, (out_f, in_f) in ternary_specs.items():
-        w = _ternary(out_f, in_f, gen)
+    for name, (in_f, out_f) in ternary_specs.items():
+        w = _ternary(in_f, out_f, gen)
         tensors[f"{name}.weight"] = w["weight"]
         tensors[f"{name}.weight_scale"] = w["weight_scale"]
 

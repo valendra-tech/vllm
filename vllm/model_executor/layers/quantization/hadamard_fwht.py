@@ -77,7 +77,9 @@ if _HAS_TRITON:
         """
         assert x.shape[-1] == 1024, "only block=1024 is supported"
         M = x.numel() // 1024
-        x2 = x.reshape(M, 1024)
+        # Rotation blocks are often slices of a wider activation matrix. The
+        # Triton pointer arithmetic assumes a packed row stride.
+        x2 = x.reshape(M, 1024).contiguous()
         y = torch.empty(M, 1024, dtype=torch.float32, device=x.device)
         _fwht_signs_kernel[(M,)](
             x2, signs.float().contiguous(), y,
@@ -92,7 +94,8 @@ def _fwht_signs_torch(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     x: (..., 1024) float32/bf16 (any device).  signs: (1024,) float.
     Returns y = H @ (signs * x) as float32 with x's shape.
     """
-    n = x.shape[-1]
+    original_shape = x.shape
+    n = original_shape[-1]
     assert n == 1024, "only block=1024 is supported"
     M = x.numel() // n
     x = x.reshape(M, n).float() * signs.to(x.device).float()
@@ -104,7 +107,7 @@ def _fwht_signs_torch(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
         x[..., 0, :] = a + b
         x[..., 1, :] = a - b
         h *= 2
-    return (x.view(M, n) * (1.0 / (n ** 0.5)))
+    return (x.view(M, n) * (1.0 / (n ** 0.5))).reshape(original_shape)
 
 
 def fwht_signs(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
@@ -112,6 +115,8 @@ def fwht_signs(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
 
     x: (..., 1024) float32/bf16 cuda (works on cpu too).  signs: (1024,).
     """
+    if x.is_cuda and _HAS_TRITON:
+        return fwht_signs_triton(x, signs)
     return _fwht_signs_torch(x, signs)
 
 
@@ -132,7 +137,7 @@ def fwht_signs_quant_fp8(
     groups = y.reshape(M, n // group, group)
     amax = groups.abs().amax(dim=-1).clamp(min=1e-12)
     q = (groups / amax.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    return q.reshape(y.shape), amax
+    return q.reshape(y.shape), amax.reshape(*y.shape[:-1], n // group)
 
 
 if __name__ == "__main__":

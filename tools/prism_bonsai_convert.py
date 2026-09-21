@@ -1,11 +1,11 @@
 """Convert a Prism Bonsai2 PQ2_0 GGUF into HF safetensors (ternary Q2b1 + scales).
 
-Validated layout facts (cross-checked against HF Qwen/Qwen3.8-27B and the
+Validated layout facts (cross-checked against llama.cpp and the
 prism.hadamard metadata of this GGUF):
 - GGUF matmul weights store (ne0=in_features, ne1=out_features); HF wants (out, in).
-- PQ2_0 blocks are o-major: block b = o*G + g with G = ne0/128 input groups per
-  output row; fp16 scale d[b] belongs to (output row o, input group g) and is
-  preserved 1:1 through the transpose (HF scale[i, g] = d[o*G + g]).
+- PQ2_0 blocks are output-major: block b = o*G + g with G = ne0/128 input
+  groups per output row; fp16 scale d[b] belongs to (output row o, input
+  group g) and is preserved 1:1 in the HF `(out, in)` layout.
 - Export ternarized W = Hadamard-fold(signs * W0) with an error-compensated
   threshold (d is a dequantization scale, not the decision boundary), so the
   converter preserves trits and scales byte-exactly instead of re-quantizing.
@@ -62,6 +62,53 @@ _GLOBAL_MAP = {
     "output_norm.weight": "model.norm.weight",
 }
 
+_GEMMA_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    ".self_attn.q_norm.weight",
+    ".self_attn.k_norm.weight",
+    "model.norm.weight",
+)
+
+_GDN_HEAD_SOURCE_FOR_TARGET = np.arange(48).reshape(3, 16).T.reshape(-1)
+_GDN_QKV_WIDTH = 4096
+_GDN_VALUE_WIDTH = 6144
+_GDN_VALUE_GROUP = 128
+
+
+def _reorder_gdn_heads(values):
+    """Convert GGUF rep-major GDN heads to vLLM's grouped-head order."""
+    if values.shape[0] != len(_GDN_HEAD_SOURCE_FOR_TARGET):
+        return values
+    return np.ascontiguousarray(values[_GDN_HEAD_SOURCE_FOR_TARGET])
+
+
+def _reorder_gdn_value_channels(values):
+    """Reorder the value part of a [q, k, v] channel tensor."""
+    value = values[_GDN_QKV_WIDTH : _GDN_QKV_WIDTH + _GDN_VALUE_WIDTH]
+    value = value.reshape(3, 16, _GDN_VALUE_GROUP, -1).transpose(1, 0, 2, 3)
+    value = value.reshape(-1, *values.shape[1:])
+    return np.concatenate((values[:_GDN_QKV_WIDTH], value))
+
+
+def _reorder_gdn_ternary_output(trits, scales, hf_name):
+    if hf_name.endswith("linear_attn.in_proj_qkv.weight"):
+        start = _GDN_QKV_WIDTH
+    elif hf_name.endswith("linear_attn.in_proj_z.weight"):
+        start = 0
+    else:
+        return trits, scales
+
+    source = _GDN_HEAD_SOURCE_FOR_TARGET
+    rows = (
+        start + source[:, None] * _GDN_VALUE_GROUP + np.arange(_GDN_VALUE_GROUP)
+    ).reshape(-1)
+    reordered_trits = trits.copy()
+    reordered_scales = scales.copy()
+    reordered_trits[start : start + _GDN_VALUE_WIDTH] = trits[rows]
+    reordered_scales[start : start + _GDN_VALUE_WIDTH] = scales[rows]
+    return reordered_trits, reordered_scales
+
 
 def build_name_map(reader):
     interval = int(reader.kv.get("qwen35.full_attention_interval", 4))
@@ -101,31 +148,29 @@ def pack_q2b1_codes(trits):
 
 
 def decode_pq2_tensor_trits(reader, info):
-    """Decode a PQ2_0 tensor to (trits (n_out, n_in) int8, d (n_out, n_in//128) float16).
+    """Decode to standard HF layout: trits (out, in), scales (out, in//128).
 
-    Blocks are o-major (b = o*G + g): row o of the result concatenates the G
-    128-weight blocks of that output row; d[o, g] is the file's scale for that
-    (output row, input group) pair, preserved byte-exactly.
+    GGML quantization groups the 128 input values in each output row. Blocks
+    are ordered output-major: block index ``b = out * G + input_group``.
     """
-    ne0, ne1 = info.dims  # (n_in, n_out)
-    n_in, n_out = int(ne0), int(ne1)
-    if n_in % 128 != 0:
-        raise ValueError(f"{info.name}: input width {n_in} not a multiple of 128")
-    n_groups = n_in // 128
-    n_blocks = n_out * n_groups
+    ne0, ne1 = (int(x) for x in info.dims)
+    if ne0 % 128 != 0:
+        raise ValueError(f"{info.name}: ne0 {ne0} not a multiple of 128")
+    n_groups = ne0 // 128
+    n_blocks = ne1 * n_groups
     blocks = np.frombuffer(reader.tensor_data(info), np.uint8).reshape(n_blocks, 34)
-    d = blocks[:, :2].copy().view(np.float16).reshape(n_out, n_groups)
+    d = blocks[:, :2].copy().view(np.float16).reshape(ne1, n_groups)
     qs = blocks[:, 2:]
     shifts = np.uint8(2 * np.arange(4, dtype=np.uint8))
     codes = ((qs.reshape(n_blocks, 32, 1) >> shifts) & np.uint8(3)).reshape(n_blocks, 128)
     if (codes == 3).any():
         raise ValueError(f"PQ2_0 code 3 (+2) found in {info.name}: not a ternary tensor")
     trits = PQ2_CODE_TO_TRIT[codes]  # (n_blocks, 128) int8
-    return np.ascontiguousarray(trits.reshape(n_out, n_in)), d
+    return np.ascontiguousarray(trits.reshape(ne1, ne0)), d
 
 
-def encode_ternary_hf(trits, d):
-    """Encode (trits (n_out, n_in), d (n_out, n_in//128)) as HF Q2b1 (qs, scale)."""
+def encode_ternary_natural(trits, d):
+    """Encode standard (out, in) trits and scales as Q2b1 tensors."""
     qs = pack_q2b1_codes(trits)
     scale = np.ascontiguousarray(d, dtype=np.float16)
     return qs, scale
@@ -133,25 +178,69 @@ def encode_ternary_hf(trits, d):
 
 def convert_ternary(reader, info, hf_name, out):
     trits, d = decode_pq2_tensor_trits(reader, info)
-    qs, scale = encode_ternary_hf(trits, d)
+    trits, d = _reorder_gdn_ternary_output(trits, d, hf_name)
+    qs, scale = encode_ternary_natural(trits, d)
     out[hf_name] = torch.from_numpy(qs)
     out[hf_name + "_scale"] = torch.from_numpy(scale)
 
 
+def _fuse_gdn_qkvz_tensors(tensors):
+    """Fuse the separate GGUF qkv and gate tensors for Qwen3.5's module."""
+    qkv_suffix = ".linear_attn.in_proj_qkv.weight"
+    for qkv_name in list(tensors):
+        if not qkv_name.endswith(qkv_suffix):
+            continue
+        prefix = qkv_name[: -len(qkv_suffix)]
+        z_name = prefix + ".linear_attn.in_proj_z.weight"
+        qkv_scale_name = qkv_name + "_scale"
+        z_scale_name = z_name + "_scale"
+        if z_name not in tensors or z_scale_name not in tensors:
+            raise ValueError(f"missing GDN gate tensor for {qkv_name}")
+        fused_name = prefix + ".linear_attn.in_proj_qkvz.weight"
+        tensors[fused_name] = torch.cat((tensors[qkv_name], tensors[z_name]), dim=0)
+        tensors[fused_name + "_scale"] = torch.cat(
+            (tensors[qkv_scale_name], tensors[z_scale_name]), dim=0
+        )
+        del tensors[qkv_name], tensors[z_name]
+        del tensors[qkv_scale_name], tensors[z_scale_name]
+
+
 def convert_f32(reader, info, hf_name, out):
-    arr = np.frombuffer(reader.tensor_data(info), np.float32).reshape(info.dims)
+    shape = tuple(reversed(info.dims)) if len(info.dims) == 2 else info.dims
+    arr = np.frombuffer(reader.tensor_data(info), np.float32).copy().reshape(shape)
     if arr.ndim == 2:
-        arr = np.ascontiguousarray(arr.T)  # (in, out) -> (out, in)
         if hf_name.endswith("linear_attn.conv1d.weight"):
-            arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
-    out[hf_name] = torch.from_numpy(arr)
+            # Checkpoint layout is (conv_dim, 1, kernel); the GDN module's
+            # depthwise Conv1d expects the singleton channel dim.
+            arr = _reorder_gdn_value_channels(arr)
+            arr = arr[:, None, :]
+    if hf_name.endswith(_GEMMA_NORM_SUFFIXES):
+        # GGUF/llama.cpp stores Qwen3.5's effective RMSNorm weight, while
+        # vLLM's GemmaRMSNorm stores the zero-centered value and adds 1.
+        arr -= np.float32(1.0)
+    if hf_name.endswith(".linear_attn.A_log"):
+        # llama.cpp stores the already-expanded decay coefficient -exp(A_log),
+        # while vLLM's GDN kernel applies -exp() itself.
+        if np.any(arr >= 0):
+            raise ValueError(f"expected negative expanded A_log values in {hf_name}")
+        arr = np.log(-arr)
+    if hf_name.endswith(".linear_attn.A_log") or hf_name.endswith(
+        ".linear_attn.dt_bias"
+    ):
+        arr = _reorder_gdn_heads(arr)
+    # The model dtype is bf16; F32 norm/conv/scalar weights are downcast so
+    # vLLM's RMSNorm keeps the activation dtype consistent end-to-end.
+    out[hf_name] = torch.from_numpy(arr).to(torch.bfloat16)
 
 
 def convert_bf16(reader, info, hf_name, out):
     u16 = np.frombuffer(reader.tensor_data(info), np.uint16)
-    t = torch.from_numpy(np.ascontiguousarray(u16)).view(torch.bfloat16).reshape(info.dims)
-    if t.dim() == 2:
-        t = t.t().contiguous()
+    shape = tuple(reversed(info.dims)) if len(info.dims) == 2 else info.dims
+    t = torch.from_numpy(np.ascontiguousarray(u16)).view(torch.bfloat16).reshape(shape)
+    if hf_name.endswith(
+        (".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")
+    ):
+        t = t[torch.from_numpy(_GDN_HEAD_SOURCE_FOR_TARGET).to(t.device)]
     out[hf_name] = t
 
 
@@ -270,9 +359,24 @@ def export_tokenizer(reader, out_dir):
     ggml_tokens = reader.get_strs("tokenizer.ggml.tokens")
     spot_ids = [0, 1, 42, 248044, 248046]
     spot_ok = all(tok.convert_ids_to_tokens(i) == ggml_tokens[i] for i in spot_ids)
+    added = 0
+    if len(tok) < len(ggml_tokens) and spot_ok:
+        extra_tokens = ggml_tokens[len(tok):]
+        added = tok.add_tokens(extra_tokens, special_tokens=True)
+        for attr, token_id in (
+            ("bos_token", GENERATION_CONFIG["bos_token_id"]),
+            ("eos_token", GENERATION_CONFIG["eos_token_id"]),
+            ("pad_token", GENERATION_CONFIG["pad_token_id"]),
+        ):
+            setattr(tok, attr, ggml_tokens[token_id])
+
+    spot_ok = all(tok.convert_ids_to_tokens(i) == ggml_tokens[i] for i in spot_ids)
     if len(tok) == len(ggml_tokens) and spot_ok:
         tok.save_pretrained(out_dir)
-        print(f"[tokenizer] verified (len={len(tok)}, spot-check ok) and saved to {out_dir}")
+        print(
+            f"[tokenizer] verified (len={len(tok)}, added={added}, "
+            f"spot-check ok) and saved to {out_dir}"
+        )
     else:
         print(
             f"[tokenizer] CONCERN: vocab mismatch len(tok)={len(tok)} vs ggml={len(ggml_tokens)}, "
