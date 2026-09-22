@@ -1190,9 +1190,7 @@ def test_cooperative_topk_barrier_contracts() -> None:
         )
         assert wrapper is not None, f"missing {name} wrapper"
         body = wrapper.group("body")
-        assert ': "memory"' in body, (
-            f"{name} wrapper must include a memory clobber"
-        )
+        assert ': "memory"' in body, f"{name} wrapper must include a memory clobber"
         wrapper_bodies[name] = body
 
     assert ".acquire." in wrapper_bodies["mbarrier_wait"]
@@ -1204,8 +1202,7 @@ def test_cooperative_topk_barrier_contracts() -> None:
         flags=re.MULTILINE,
     )
     assert call_sites == ["mbarrier_arrive_expect_tx", "tma_load"] * 3, (
-        "expected three arrive-before-load call-site pairs, "
-        f"got {call_sites!r}"
+        f"expected three arrive-before-load call-site pairs, got {call_sites!r}"
     )
 
 
