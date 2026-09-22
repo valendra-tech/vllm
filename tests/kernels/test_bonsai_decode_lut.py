@@ -1,5 +1,6 @@
 import os
 import sys
+
 import numpy as np
 import pytest
 import torch
@@ -39,9 +40,11 @@ def test_decode_lut_cpu_fallback():
 def test_decode_lut_matches_numpy():
     _require_supported_cuda()
     from prism_pq2 import q2b1_to_trits
+
     torch.manual_seed(0)
     packed = torch.randint(0, 256, (1 << 20,), dtype=torch.uint8, device="cuda")
     from vllm.model_executor.layers.quantization.bonsai_decode import decode_trits
+
     trits = decode_trits(packed)  # (n, 4) int8 on cuda
     lut = q2b1_to_trits()
     expected = lut[packed.cpu().numpy().astype(int)]
@@ -78,9 +81,7 @@ def test_q2b1_gemm_matches_reference(m, n, k):
         expected = _q2b1_reference(x, packed, scales)
 
         assert got.dtype == torch.bfloat16
-        torch.testing.assert_close(
-            got.float(), expected.float(), rtol=1e-2, atol=1e-1
-        )
+        torch.testing.assert_close(got.float(), expected.float(), rtol=1e-2, atol=1e-1)
 
 
 def test_q2b1_gemm_rejects_m_above_64():
@@ -124,9 +125,7 @@ def test_q2b1_gemm_autotune_cache_matches_reference(monkeypatch):
     m, n, k = 1, 128, 1024
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(29)
-        packed = torch.randint(
-            0, 256, (n, k // 4), dtype=torch.uint8, device="cuda"
-        )
+        packed = torch.randint(0, 256, (n, k // 4), dtype=torch.uint8, device="cuda")
         scales = (
             torch.rand(n, k // 128, device="cuda", dtype=torch.float16) + 0.5
         ).contiguous()
@@ -192,9 +191,7 @@ def test_q2b1_gemm_autotune_disabled(monkeypatch):
             (x.shape[0], packed.shape[0]), dtype=torch.bfloat16, device=x.device
         )
 
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm", capture_config, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm", capture_config, raising=True)
 
     def fail_benchmark(*args, **kwargs):
         raise AssertionError(
@@ -239,9 +236,7 @@ def test_q2b1_gemm_skips_autotune_while_compiling(monkeypatch):
             (x.shape[0], packed.shape[0]), dtype=torch.bfloat16, device=x.device
         )
 
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm", capture_config, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm", capture_config, raising=True)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
 
     def fail_benchmark(*args, **kwargs):
@@ -274,9 +269,7 @@ def test_q2b1_gemm_autotuned_uses_compile_cache(monkeypatch):
         selected_configs.append(config_id)
         return torch.empty((x.shape[0], packed.shape[0]), dtype=torch.bfloat16)
 
-    monkeypatch.setattr(
-        bonsai_decode, "_validate_q2b1_gemm_inputs", lambda *args: None
-    )
+    monkeypatch.setattr(bonsai_decode, "_validate_q2b1_gemm_inputs", lambda *args: None)
     monkeypatch.setattr(bonsai_decode, "q2b1_gemm", capture_config)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
 
@@ -323,12 +316,8 @@ def test_prewarm_q2b1_autotune_reuses_shapes_and_honors_disable(monkeypatch):
         bonsai_decode._AUTOTUNE_CACHE[eager_key] = selected_by_m[m]
         return torch.empty((m, received_packed.shape[0]), dtype=torch.bfloat16)
 
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned
-    )
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda device: (8, 0)
-    )
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
 
     eager_cache = bonsai_decode._AUTOTUNE_CACHE
     compile_cache = bonsai_decode._COMPILE_AUTOTUNE_CACHE
@@ -344,12 +333,8 @@ def test_prewarm_q2b1_autotune_reuses_shapes_and_honors_disable(monkeypatch):
             (1, 128, torch.float32),
             (2, 128, torch.float32),
         ]
-        assert compile_cache[
-            (None, 1, 7, 128, torch.float32)
-        ] == 1
-        assert compile_cache[
-            (None, 2, 7, 128, torch.float32)
-        ] == 2
+        assert compile_cache[(None, 1, 7, 128, torch.float32)] == 1
+        assert compile_cache[(None, 2, 7, 128, torch.float32)] == 2
 
         bonsai_decode.prewarm_q2b1_autotune(packed, scales, (1, 2, 4))
         assert eager_calls == [
@@ -357,9 +342,7 @@ def test_prewarm_q2b1_autotune_reuses_shapes_and_honors_disable(monkeypatch):
             (2, 128, torch.float32),
             (4, 128, torch.float32),
         ]
-        assert compile_cache[
-            (None, 4, 7, 128, torch.float32)
-        ] == 0
+        assert compile_cache[(None, 4, 7, 128, torch.float32)] == 0
 
         monkeypatch.setenv("BONSAI_AUTOTUNE", "0")
         bonsai_decode.prewarm_q2b1_autotune(packed, scales, (8,))
@@ -388,14 +371,10 @@ def test_q2b1_gemm_compile_cold_state_does_not_load_extension(monkeypatch):
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(bonsai_decode, "_ext", None, raising=True)
-    monkeypatch.setattr(
-        bonsai_decode, "_validate_q2b1_gemm_inputs", fail, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_validate_q2b1_gemm_inputs", fail, raising=True)
     monkeypatch.setattr(bonsai_decode, "_load_ext", fail, raising=True)
     monkeypatch.setattr(torch.cuda, "device", fail, raising=True)
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", fail, raising=True
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", fail, raising=True)
 
     with pytest.raises(
         RuntimeError,
@@ -425,9 +404,7 @@ def test_decode_trits_compile_cold_state_does_not_initialize_state(monkeypatch):
     monkeypatch.setattr(bonsai_decode, "_load_ext", fail, raising=True)
     monkeypatch.setattr(bonsai_decode, "_make_lut", fail, raising=True)
     monkeypatch.setattr(torch.cuda, "device", fail, raising=True)
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", fail, raising=True
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", fail, raising=True)
 
     with pytest.raises(
         RuntimeError,
@@ -439,12 +416,8 @@ def test_decode_trits_compile_cold_state_does_not_initialize_state(monkeypatch):
 def test_decode_trits_compile_cached_unavailable_uses_cpu_fallback(monkeypatch):
     from vllm.model_executor.layers.quantization import bonsai_decode
 
-    packed = torch.tensor(
-        [0b11_10_01_00, 0b00_01_10_11], dtype=torch.uint8
-    )
-    expected = torch.tensor(
-        [[0, 1, -1, 0], [0, -1, 1, 0]], dtype=torch.int8
-    )
+    packed = torch.tensor([0b11_10_01_00, 0b00_01_10_11], dtype=torch.uint8)
+    expected = torch.tensor([[0, 1, -1, 0], [0, -1, 1, 0]], dtype=torch.int8)
     unavailable = bonsai_decode.BonsaiQ2b1UnavailableError(
         "cached extension load failure"
     )
@@ -459,9 +432,7 @@ def test_decode_trits_compile_cached_unavailable_uses_cpu_fallback(monkeypatch):
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(bonsai_decode, "_ext", None, raising=True)
-    monkeypatch.setattr(
-        bonsai_decode, "_ext_error", unavailable, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_ext_error", unavailable, raising=True)
     monkeypatch.setattr(bonsai_decode, "_LUT_CACHE", {}, raising=True)
     monkeypatch.setattr(
         bonsai_decode, "_decode_lut_op", fail("custom op"), raising=True
@@ -489,9 +460,7 @@ def test_q2b1_gemm_compile_cached_unavailable_uses_fallback(monkeypatch):
         ]
     )
     scales = torch.tensor([[0.5], [2.0]], dtype=torch.float16)
-    expected = torch.tensor(
-        [[64.0, -256.0], [64.0, -256.0]], dtype=torch.bfloat16
-    )
+    expected = torch.tensor([[64.0, -256.0], [64.0, -256.0]], dtype=torch.bfloat16)
     unavailable = bonsai_decode.BonsaiQ2b1UnavailableError(
         "cached extension load failure"
     )
@@ -505,12 +474,8 @@ def test_q2b1_gemm_compile_cached_unavailable_uses_fallback(monkeypatch):
         return callback
 
     monkeypatch.setattr(bonsai_decode, "_ext", None, raising=True)
-    monkeypatch.setattr(
-        bonsai_decode, "_ext_error", unavailable, raising=True
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "_q2b1_gemm_op", fail("custom op"), raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_ext_error", unavailable, raising=True)
+    monkeypatch.setattr(bonsai_decode, "_q2b1_gemm_op", fail("custom op"), raising=True)
     monkeypatch.setattr(
         bonsai_decode, "_load_ext", fail("extension load"), raising=True
     )
@@ -538,9 +503,7 @@ def test_q2b1_gemm_autotuned_compile_cached_unavailable_skips_cache(monkeypatch)
         ]
     )
     scales = torch.tensor([[0.5], [2.0]], dtype=torch.float16)
-    expected = torch.tensor(
-        [[64.0, -256.0], [64.0, -256.0]], dtype=torch.bfloat16
-    )
+    expected = torch.tensor([[64.0, -256.0], [64.0, -256.0]], dtype=torch.bfloat16)
     unavailable = bonsai_decode.BonsaiQ2b1UnavailableError(
         "cached extension load failure"
     )
@@ -559,16 +522,14 @@ def test_q2b1_gemm_autotuned_compile_cached_unavailable_skips_cache(monkeypatch)
 
     monkeypatch.delenv("BONSAI_AUTOTUNE", raising=False)
     monkeypatch.setattr(bonsai_decode, "_ext", None, raising=True)
+    monkeypatch.setattr(bonsai_decode, "_ext_error", unavailable, raising=True)
     monkeypatch.setattr(
-        bonsai_decode, "_ext_error", unavailable, raising=True
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "_COMPILE_AUTOTUNE_CACHE", ForbiddenCompileCache(),
+        bonsai_decode,
+        "_COMPILE_AUTOTUNE_CACHE",
+        ForbiddenCompileCache(),
         raising=True,
     )
-    monkeypatch.setattr(
-        bonsai_decode, "_q2b1_gemm_op", fail("custom op"), raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_q2b1_gemm_op", fail("custom op"), raising=True)
     monkeypatch.setattr(
         bonsai_decode, "_load_ext", fail("extension load"), raising=True
     )
@@ -598,9 +559,7 @@ def test_q2b1_gemm_autotuned_compile_disables_cached_config(monkeypatch):
         return torch.empty((x.shape[0], packed.shape[0]), dtype=torch.bfloat16)
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    monkeypatch.setattr(
-        bonsai_decode, "_validate_q2b1_gemm_inputs", lambda *args: None
-    )
+    monkeypatch.setattr(bonsai_decode, "_validate_q2b1_gemm_inputs", lambda *args: None)
     monkeypatch.setattr(bonsai_decode, "q2b1_gemm", capture_config)
     monkeypatch.setenv("BONSAI_AUTOTUNE", "0")
 
@@ -653,16 +612,12 @@ def test_prewarm_capture_check_uses_packed_device(monkeypatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.delenv("BONSAI_AUTOTUNE", raising=False)
     monkeypatch.setattr(torch.cuda, "device", device_scope)
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", capture_check
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capture_check)
 
     def fail_autotune(*args, **kwargs):
         raise AssertionError("prewarm must stop during capture")
 
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm_autotuned", fail_autotune
-    )
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm_autotuned", fail_autotune)
     bonsai_decode.prewarm_q2b1_autotune(packed, object(), (1,))
 
     assert active_devices == []
@@ -711,12 +666,8 @@ def test_prewarm_waits_for_inflight_shape(monkeypatch):
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.delenv("BONSAI_AUTOTUNE", raising=False)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda device: (8, 0)
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned
-    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned)
 
     eager_cache = bonsai_decode._AUTOTUNE_CACHE
     compile_cache = bonsai_decode._COMPILE_AUTOTUNE_CACHE
@@ -787,9 +738,7 @@ def test_q2b1_gemm_is_compile_safe():
     scales = torch.ones((2, 1), dtype=torch.float16, device="cuda")
     x = torch.ones((1, 128), dtype=torch.float32, device="cuda")
     compiled = torch.compile(
-        lambda value: bonsai_decode.q2b1_gemm(
-            value, packed, scales, config_id=0
-        ),
+        lambda value: bonsai_decode.q2b1_gemm(value, packed, scales, config_id=0),
         fullgraph=True,
         backend="eager",
     )
@@ -933,12 +882,8 @@ def test_prewarm_failure_notifies_waiter_and_allows_retry(monkeypatch):
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.delenv("BONSAI_AUTOTUNE", raising=False)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda device: (8, 0)
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned
-    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
+    monkeypatch.setattr(bonsai_decode, "q2b1_gemm_autotuned", fake_autotuned)
 
     eager_cache = bonsai_decode._AUTOTUNE_CACHE
     compile_cache = bonsai_decode._COMPILE_AUTOTUNE_CACHE

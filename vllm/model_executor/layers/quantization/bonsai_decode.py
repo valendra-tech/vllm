@@ -4,6 +4,7 @@ Loads the LUT into shared memory once per block; each thread decodes its byte
 into 4 int8 trits. Extension is compiled once via torch.utils.cpp_extension.load
 and cached by torch's extension cache.
 """
+
 import os
 import threading
 
@@ -20,9 +21,7 @@ _AUTOTUNE_CONDITION = threading.Condition()
 _AUTOTUNE_INFLIGHT = set()
 _COMPILE_AUTOTUNE_CACHE = {}
 _PREWARM_INFLIGHT = set()
-_CAPTURE_ERROR = (
-    "q2b1_gemm extension must be preloaded before CUDA graph capture"
-)
+_CAPTURE_ERROR = "q2b1_gemm extension must be preloaded before CUDA graph capture"
 
 
 class BonsaiQ2b1UnavailableError(RuntimeError):
@@ -70,9 +69,7 @@ def _load_ext():
                 try:
                     from torch.utils.cpp_extension import load
 
-                    _ext = load(
-                        name="bonsai_decode_lut", sources=[src], verbose=False
-                    )
+                    _ext = load(name="bonsai_decode_lut", sources=[src], verbose=False)
                 except (ImportError, OSError, RuntimeError) as exc:
                     _ext_error = BonsaiQ2b1UnavailableError(
                         "failed to load the Bonsai Q2b1 extension"
@@ -88,9 +85,7 @@ def _decode_lut_op(packed: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
 
 @_decode_lut_op.register_fake
 def _(packed: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
-    return torch.empty(
-        (*packed.shape, 4), dtype=torch.int8, device=packed.device
-    )
+    return torch.empty((*packed.shape, 4), dtype=torch.int8, device=packed.device)
 
 
 @torch.library.custom_op("bonsai::q2b1_gemm", mutates_args=())
@@ -104,8 +99,9 @@ def _q2b1_gemm_op(
 
 
 @_q2b1_gemm_op.register_fake
-def _(x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
-      config_id: int) -> torch.Tensor:
+def _(
+    x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, config_id: int
+) -> torch.Tensor:
     return torch.empty(
         (x.shape[0], packed.shape[0]), dtype=torch.bfloat16, device=x.device
     )
@@ -131,12 +127,8 @@ def _make_lut(device):
 
 def _decode_trits_fallback(packed: torch.Tensor) -> torch.Tensor:
     packed = packed.contiguous().reshape(-1)
-    codes = torch.stack(
-        [(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1
-    )
-    lut = torch.tensor(
-        [0, 1, -1, 0], dtype=torch.int8, device=packed.device
-    )
+    codes = torch.stack([(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1)
+    lut = torch.tensor([0, 1, -1, 0], dtype=torch.int8, device=packed.device)
     return lut[codes.long()]
 
 
@@ -273,8 +265,7 @@ def _benchmark_gemm_config(
             end.record(stream)
         end_events[-1].synchronize()
         timings = [
-            start.elapsed_time(end)
-            for start, end in zip(start_events, end_events)
+            start.elapsed_time(end) for start, end in zip(start_events, end_events)
         ]
 
     return float(sorted(timings)[len(timings) // 2])
@@ -361,9 +352,7 @@ def prewarm_q2b1_autotune(
 
     k = packed.shape[1] * 4
     for m in m_values:
-        compile_cache_key = (
-            packed.device.index, m, packed.shape[0], k, torch.float32
-        )
+        compile_cache_key = (packed.device.index, m, packed.shape[0], k, torch.float32)
         owner = False
         with _AUTOTUNE_CONDITION:
             while True:
@@ -378,9 +367,7 @@ def prewarm_q2b1_autotune(
             continue
 
         try:
-            x = torch.zeros(
-                (m, k), device=packed.device, dtype=torch.float32
-            )
+            x = torch.zeros((m, k), device=packed.device, dtype=torch.float32)
             q2b1_gemm_autotuned(x, packed, scales)
             config_id = _AUTOTUNE_CACHE.get(_autotune_cache_key(x, packed))
             if config_id is not None:

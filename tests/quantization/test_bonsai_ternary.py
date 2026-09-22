@@ -1,10 +1,20 @@
+import os
 import struct
+import sys
+
 import numpy as np
-import torch
 import pytest
-import sys, os
+import torch
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
-from prism_pq2 import decode_pq2_block, encode_pq2_block, pq2_to_q2b1_bytes, q2b1_to_trits, hadamard_matrix
+from prism_pq2 import (
+    decode_pq2_block,
+    encode_pq2_block,
+    hadamard_matrix,
+    pq2_to_q2b1_bytes,
+    q2b1_to_trits,
+)
+
 
 def test_decode_pq2_block_golden():
     # codes (0,1,2,1) = (-1,0,+1,0) packed LSB-first in byte0
@@ -16,6 +26,7 @@ def test_decode_pq2_block_golden():
     assert w[0] == -0.5 and w[1] == 0.0 and w[2] == 0.5 and w[3] == 0.0
     assert np.all(w[4:] == 0.0)  # remaining codes all 1 -> 0
 
+
 def test_roundtrip_pq2():
     rng = np.random.default_rng(0)
     t = rng.choice([-1.0, 0.0, 1.0], size=128).astype(np.float32)
@@ -24,16 +35,25 @@ def test_roundtrip_pq2():
     w = decode_pq2_block(qs, d)
     assert np.array_equal(w, t)
 
+
 def test_pq2_to_q2b1_bytes():
-    # PQ2 codes (0,1,2,1) -> trits (-1,0,+1,0) -> Q2b1 codes (2,0,1,0) -> byte 0b00_01_00_10 = 0x12
+    # PQ2 codes (0,1,2,1) -> trits (-1,0,+1,0) -> Q2b1 codes
+    # (2,0,1,0) -> byte 0b00_01_00_10 = 0x12
     qs = np.array([0b01_10_01_00], dtype=np.uint8)
     out = pq2_to_q2b1_bytes(qs)
     assert out[0] == 0x12
 
+
 def test_q2b1_lut_matches_candle():
     lut = q2b1_to_trits()
-    assert lut[0b00][0] == 0 and lut[0b01][0] == 1 and lut[0b10][0] == -1 and lut[0b11][0] == 0
+    assert (
+        lut[0b00][0] == 0
+        and lut[0b01][0] == 1
+        and lut[0b10][0] == -1
+        and lut[0b11][0] == 0
+    )
     assert lut.shape == (256, 4) and lut.dtype == np.int8
+
 
 def test_hadamard_matrix_matches_fork():
     H = hadamard_matrix(1024)
@@ -41,22 +61,32 @@ def test_hadamard_matrix_matches_fork():
     s = 1.0 / np.sqrt(1024.0)
     i, j = 5, 3
     par = i & j
-    par ^= par >> 16; par ^= par >> 8; par ^= par >> 4; par ^= par >> 2; par ^= par >> 1
+    par ^= par >> 16
+    par ^= par >> 8
+    par ^= par >> 4
+    par ^= par >> 2
+    par ^= par >> 1
     assert H[i, j] == (-s if par & 1 else s)
     assert np.allclose(H @ H.T, np.eye(1024), atol=1e-5)
 
+
 GGUF_PATH = "/dev/shm/bonsai-pq2.gguf"
+
 
 def test_gguf_reader_metadata_and_dir():
     import os
+
     if not os.path.exists(GGUF_PATH):
         pytest.skip("GGUF not present on this machine")
     from gguf_reader_min import GgufMinReader
+
     r = GgufMinReader(GGUF_PATH)
     assert r.get_str("general.architecture") == "qwen35"
     assert r.get_i32("qwen35.block_count") == 64
     assert r.get_i32("prism.hadamard.block_size") == 1024
-    assert r.get_str("prism.hadamard.transform") == "normalized-sylvester-walsh-hadamard"
+    assert (
+        r.get_str("prism.hadamard.transform") == "normalized-sylvester-walsh-hadamard"
+    )
     assert r.get_str("prism.hadamard.axis") == "input-last-dimension"
     assert r.get_str("prism.hadamard.sign_mode") == "explicit"
     assert r.get_strs("prism.hadamard.inverse_weight_names") == ["token_embd.weight"]
@@ -64,7 +94,10 @@ def test_gguf_reader_metadata_and_dir():
     assert len(r.get_i32s("prism.hadamard.sign_values")) == 5120 + 6144 + 17408
     assert len(r.tensors) == 851
     by = {t.name: t for t in r.tensors}
-    assert by["output.weight"].dims == (5120, 248320) and by["output.weight"].ggml_type == 142
+    assert (
+        by["output.weight"].dims == (5120, 248320)
+        and by["output.weight"].ggml_type == 142
+    )
     assert by["blk.0.attn_qkv.weight"].dims == (5120, 10240)
     assert by["blk.0.ssm_out.weight"].dims == (6144, 5120)
     assert by["output_norm.weight"].ggml_type == 0
@@ -79,9 +112,7 @@ def test_gguf_reader_does_not_truncate_wide_header_counts(
     tmp_path, tensor_count, metadata_kv_count
 ):
     path = tmp_path / "wide-count.gguf"
-    path.write_bytes(
-        b"GGUF" + struct.pack("<IQQ", 3, tensor_count, metadata_kv_count)
-    )
+    path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, tensor_count, metadata_kv_count))
 
     from gguf_reader_min import GgufMinReader
 
@@ -100,9 +131,7 @@ def test_gguf_reader_defaults_alignment_to_32(tmp_path):
 
 
 @pytest.mark.parametrize("alignment", (24, 64, 8192))
-def test_gguf_reader_uses_general_alignment_for_tensor_data(
-    tmp_path, alignment
-):
+def test_gguf_reader_uses_general_alignment_for_tensor_data(tmp_path, alignment):
     path = tmp_path / f"alignment-{alignment}.gguf"
     key = b"general.alignment"
     name = b"marker"
@@ -121,10 +150,7 @@ def test_gguf_reader_uses_general_alignment_for_tensor_data(
     )
     data_start = (len(prefix) + alignment - 1) // alignment * alignment
     path.write_bytes(
-        prefix
-        + b"\x00" * (data_start - len(prefix))
-        + b"\x00" * alignment
-        + marker
+        prefix + b"\x00" * (data_start - len(prefix)) + b"\x00" * alignment + marker
     )
 
     from gguf_reader_min import GgufMinReader
@@ -175,6 +201,7 @@ def test_q2b1_pack_roundtrip():
     rng = np.random.default_rng(1)
     trits = rng.choice([-1, 0, 1], size=(64, 128)).astype(np.int8)
     from prism_bonsai_convert import pack_q2b1_codes
+
     packed = pack_q2b1_codes(trits)
     assert packed.shape == (64, 32) and packed.dtype == np.uint8
     lut = q2b1_to_trits()
@@ -190,6 +217,7 @@ def test_q2b1_pack_bit_positions():
     trits[0, 4] = 1
     trits[0, 5] = -1
     from prism_bonsai_convert import pack_q2b1_codes
+
     packed = pack_q2b1_codes(trits)
     assert packed[0, 0] == 0b01_10  # weights 0,1 = codes 2,1
     assert packed[0, 1] == 0b10_01  # weights 4,5 = codes 1,2
@@ -197,10 +225,12 @@ def test_q2b1_pack_bit_positions():
 
 def test_converter_name_map_full_coverage():
     import os
+
     if not os.path.exists(GGUF_PATH):
         pytest.skip("GGUF not present")
-    from prism_bonsai_convert import build_name_map
     from gguf_reader_min import GgufMinReader
+    from prism_bonsai_convert import build_name_map
+
     r = GgufMinReader(GGUF_PATH)
     mapping = build_name_map(r)
     unmapped = [t.name for t in r.tensors if t.name not in mapping]
@@ -217,8 +247,8 @@ def test_converter_decode_standard_layout():
         pytest.skip("GGUF not present")
     import numpy as np
     from gguf_reader_min import GgufMinReader
-    from prism_pq2 import PQ2_CODE_TO_TRIT
     from prism_bonsai_convert import decode_pq2_tensor_trits
+    from prism_pq2 import PQ2_CODE_TO_TRIT
 
     r = GgufMinReader(GGUF_PATH)
     by = {t.name: t for t in r.tensors}
@@ -241,9 +271,7 @@ def test_converter_decode_standard_layout():
         ).reshape(128)
         tref = PQ2_CODE_TO_TRIT[codes]
         assert d[output_i, g] == dref
-        np.testing.assert_array_equal(
-            trits[output_i, g * 128:(g + 1) * 128], tref
-        )
+        np.testing.assert_array_equal(trits[output_i, g * 128 : (g + 1) * 128], tref)
 
 
 def test_converter_reencode_q2b1_semantics():
@@ -253,8 +281,8 @@ def test_converter_reencode_q2b1_semantics():
         pytest.skip("GGUF not present")
     import numpy as np
     from gguf_reader_min import GgufMinReader
-    from prism_pq2 import q2b1_to_trits
     from prism_bonsai_convert import decode_pq2_tensor_trits, encode_ternary_natural
+    from prism_pq2 import q2b1_to_trits
 
     r = GgufMinReader(GGUF_PATH)
     by = {t.name: t for t in r.tensors}
@@ -305,6 +333,7 @@ def test_converter_reorders_gdn_ternary_output_rows(monkeypatch):
 def test_converter_keeps_qwen35_gdn_projection_tensors_separate(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
+
     import prism_bonsai_convert as converter
 
     qkv = "model.layers.0.linear_attn.in_proj_qkv.weight"
@@ -410,9 +439,7 @@ def test_export_tokenizer_raises_on_import_or_load_failure(
         def fail_load(*_args, **_kwargs):
             raise load_failure
 
-        transformers.AutoTokenizer = types.SimpleNamespace(
-            from_pretrained=fail_load
-        )
+        transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=fail_load)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
 
     with pytest.raises(RuntimeError, match="tokenizer"):
@@ -420,9 +447,7 @@ def test_export_tokenizer_raises_on_import_or_load_failure(
 
 
 @pytest.mark.parametrize("mismatch", ("vocabulary", "spot-check"))
-def test_export_tokenizer_raises_on_tokenizer_mismatch(
-    monkeypatch, tmp_path, mismatch
-):
+def test_export_tokenizer_raises_on_tokenizer_mismatch(monkeypatch, tmp_path, mismatch):
     from prism_bonsai_convert import export_tokenizer
 
     tokens = [f"token-{i}" for i in range(248047)]
@@ -487,9 +512,7 @@ def test_export_tokenizer_success_requires_expected_artifacts(
     tokens = [f"token-{i}" for i in range(248047)]
 
     def write_expected_tokenizer(out_dir):
-        _write_tokenizer_artifacts(
-            out_dir, ("tokenizer.json", "tokenizer_config.json")
-        )
+        _write_tokenizer_artifacts(out_dir, ("tokenizer.json", "tokenizer_config.json"))
 
     tokenizer = _make_fake_tokenizer(tokens, write_expected_tokenizer)
     _install_fake_tokenizer(monkeypatch, tokenizer)
@@ -522,12 +545,11 @@ def test_export_tokenizer_main_does_not_report_success_on_failure(
         def fail_load(*_args, **_kwargs):
             raise load_failure
 
-        transformers.AutoTokenizer = types.SimpleNamespace(
-            from_pretrained=fail_load
-        )
+        transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=fail_load)
         monkeypatch.setitem(sys.modules, "transformers", transformers)
     else:
         if failure == "mismatch":
+
             def save_tokenizer(out_dir):
                 save_calls.append(out_dir)
 
@@ -542,6 +564,7 @@ def test_export_tokenizer_main_does_not_report_success_on_failure(
 
             tokenizer = _make_fake_tokenizer(tokens, fail_save)
         else:
+
             def write_partial_tokenizer(out_dir):
                 _write_tokenizer_artifacts(out_dir, ("tokenizer.json",))
 
@@ -673,21 +696,15 @@ def test_process_weights_after_loading_raw_storage(monkeypatch):
     )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(23)
-        expected_packed = torch.randint(
-            0, 256, (N, K // 4), dtype=torch.uint8
-        )
+        expected_packed = torch.randint(0, 256, (N, K // 4), dtype=torch.uint8)
         expected_scales = torch.rand(N, K // 128, dtype=torch.float16)
     layer.weight.data.copy_(expected_packed)
     layer.weight_scale.data.copy_(expected_scales)
 
     def fail_decode(_packed):
-        raise AssertionError(
-            "process_weights_after_loading must not call decode_trits"
-        )
+        raise AssertionError("process_weights_after_loading must not call decode_trits")
 
-    monkeypatch.setattr(
-        bonsai_ternary, "decode_trits", fail_decode, raising=True
-    )
+    monkeypatch.setattr(bonsai_ternary, "decode_trits", fail_decode, raising=True)
     method.process_weights_after_loading(layer)
 
     assert layer._bonsai_packed.shape == (N, K // 4)
@@ -811,6 +828,7 @@ def test_process_weights_skips_fused_setup_when_globally_disabled(monkeypatch):
 @pytest.mark.parametrize("error_type", (ImportError, OSError, RuntimeError))
 def test_bonsai_decode_wraps_extension_load_errors(monkeypatch, error_type):
     from torch.utils import cpp_extension
+
     import vllm.model_executor.layers.quantization.bonsai_decode as bonsai_decode
 
     failure = error_type("extension load failed")
@@ -829,6 +847,7 @@ def test_bonsai_decode_wraps_extension_load_errors(monkeypatch, error_type):
 
 def test_bonsai_decode_preserves_non_load_errors(monkeypatch):
     from torch.utils import cpp_extension
+
     import vllm.model_executor.layers.quantization.bonsai_decode as bonsai_decode
 
     failure = ValueError("invalid extension input")
@@ -857,14 +876,10 @@ def test_dequant_rows_uses_bit_shift_when_decoder_unavailable(monkeypatch):
     def unavailable(_packed):
         raise BonsaiQ2b1UnavailableError("decoder unavailable")
 
-    monkeypatch.setattr(
-        bonsai_ternary, "decode_trits", unavailable, raising=True
-    )
+    monkeypatch.setattr(bonsai_ternary, "decode_trits", unavailable, raising=True)
     got = BonsaiTernaryLinearMethodVLLM._dequant_rows(packed, scales)
 
-    codes = torch.stack(
-        [(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1
-    )
+    codes = torch.stack([(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1)
     lut = torch.tensor([0, 1, -1, 0], dtype=torch.float32)
     expected = (
         lut[codes.long()].reshape(1, 128)
@@ -886,14 +901,10 @@ def test_dequant_rows_uses_bit_shift_for_cpu_storage(monkeypatch):
     def fail_decode(_packed):
         raise AssertionError("CPU storage must not invoke decode_trits")
 
-    monkeypatch.setattr(
-        bonsai_ternary, "decode_trits", fail_decode, raising=True
-    )
+    monkeypatch.setattr(bonsai_ternary, "decode_trits", fail_decode, raising=True)
     got = BonsaiTernaryLinearMethodVLLM._dequant_rows(packed, scales)
 
-    codes = torch.stack(
-        [(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1
-    )
+    codes = torch.stack([(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1)
     lut = torch.tensor([0, 1, -1, 0], dtype=torch.float32)
     expected = (
         lut[codes.long()].reshape(1, 128)
@@ -941,9 +952,7 @@ def test_vllm_apply_fused_dispatch_and_env_fallback(monkeypatch):
         BonsaiTernaryQuantConfig,
     )
 
-    monkeypatch.setattr(
-        bonsai_decode, "_ext", bonsai_decode._ext, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_ext", bonsai_decode._ext, raising=True)
     monkeypatch.setattr(
         bonsai_decode, "_ext_error", bonsai_decode._ext_error, raising=True
     )
@@ -977,12 +986,8 @@ def test_vllm_apply_fused_dispatch_and_env_fallback(monkeypatch):
     layer.cuda()
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(24)
-        packed = torch.randint(
-            0, 256, (N, K // 4), device="cuda", dtype=torch.uint8
-        )
-        scales = (
-            torch.rand(N, K // 128, device="cuda") + 0.5
-        ).to(torch.float16)
+        packed = torch.randint(0, 256, (N, K // 4), device="cuda", dtype=torch.uint8)
+        scales = (torch.rand(N, K // 128, device="cuda") + 0.5).to(torch.float16)
         x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     layer.weight.data.copy_(packed)
     layer.weight_scale.data.copy_(scales)
@@ -1001,9 +1006,7 @@ def test_vllm_apply_fused_dispatch_and_env_fallback(monkeypatch):
         assert received_scales.is_cuda and received_scales.is_contiguous()
         return real_fused(xh, received_packed, received_scales)
 
-    monkeypatch.setattr(
-        bonsai_ternary, "q2b1_gemm_autotuned", fused, raising=True
-    )
+    monkeypatch.setattr(bonsai_ternary, "q2b1_gemm_autotuned", fused, raising=True)
     bias = torch.arange(N, device="cuda", dtype=torch.bfloat16)
 
     monkeypatch.setenv("BONSAI_FUSED_GEMM", "1")
@@ -1011,16 +1014,14 @@ def test_vllm_apply_fused_dispatch_and_env_fallback(monkeypatch):
     assert len(calls) == 1
     assert calls[0][1] is layer._bonsai_packed
     assert calls[0][2] is layer._bonsai_scales
-    codes = torch.stack(
-        [(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1
-    )
-    trits = torch.tensor(
-        [0, 1, -1, 0], dtype=torch.float32, device="cuda"
-    )[codes.long()].reshape(N, K)
+    codes = torch.stack([(packed >> shift) & 0x03 for shift in (0, 2, 4, 6)], dim=-1)
+    trits = torch.tensor([0, 1, -1, 0], dtype=torch.float32, device="cuda")[
+        codes.long()
+    ].reshape(N, K)
     weights = trits * scales.float().repeat_interleave(128, dim=-1)
-    expected = (
-        method._rotate(x, layer._bonsai_signs).float() @ weights.t()
-    ).to(torch.bfloat16) + bias
+    expected = (method._rotate(x, layer._bonsai_signs).float() @ weights.t()).to(
+        torch.bfloat16
+    ) + bias
     torch.testing.assert_close(
         fused,
         expected,
@@ -1042,15 +1043,13 @@ def test_vllm_apply_fused_dispatch_and_env_fallback(monkeypatch):
         [(layer._bonsai_packed >> shift) & 0x03 for shift in (0, 2, 4, 6)],
         dim=-1,
     )
-    trits = torch.tensor(
-        [0, 1, -1, 0], dtype=torch.float32, device="cuda"
-    )[codes.long()].reshape(N, K)
-    weights = trits * layer._bonsai_scales.float().repeat_interleave(
-        128, dim=-1
-    )
-    expected = (
-        method._rotate(x, layer._bonsai_signs).float() @ weights.t()
-    ).to(torch.bfloat16) + bias
+    trits = torch.tensor([0, 1, -1, 0], dtype=torch.float32, device="cuda")[
+        codes.long()
+    ].reshape(N, K)
+    weights = trits * layer._bonsai_scales.float().repeat_interleave(128, dim=-1)
+    expected = (method._rotate(x, layer._bonsai_signs).float() @ weights.t()).to(
+        torch.bfloat16
+    ) + bias
     torch.testing.assert_close(unavailable, expected)
 
     def fail_runtime(xh, received_packed, received_scales):
@@ -1089,9 +1088,7 @@ def test_vllm_apply_compile_cached_unavailable_uses_dequant_fallback(
 
     K, M, N = 128, 64, 2
     method = BonsaiTernaryLinearMethodVLLM(
-        BonsaiTernaryQuantConfig(
-            ternary_target="int4", hadamard_signs={K: [1] * K}
-        ),
+        BonsaiTernaryQuantConfig(ternary_target="int4", hadamard_signs={K: [1] * K}),
         "model.layers.0.linear_attn.in_proj_qkvz",
     )
     layer = torch.nn.Module()
@@ -1107,9 +1104,7 @@ def test_vllm_apply_compile_cached_unavailable_uses_dequant_fallback(
     layer._bonsai_scales = torch.tensor(
         [[0.5], [2.0]], dtype=torch.float16, device="cuda"
     )
-    x = torch.tensor(
-        [[1.0] * K] * M, dtype=torch.bfloat16, device="cuda"
-    )
+    x = torch.tensor([[1.0] * K] * M, dtype=torch.bfloat16, device="cuda")
     expected = torch.tensor(
         [[64.0, -256.0]] * M,
         dtype=torch.bfloat16,
@@ -1134,33 +1129,21 @@ def test_vllm_apply_compile_cached_unavailable_uses_dequant_fallback(
     real_fused = bonsai_ternary.q2b1_gemm_autotuned
 
     def record_fused(xh, received_packed, received_scales):
-        fused_dispatch_calls.append(
-            (xh, received_packed, received_scales)
-        )
+        fused_dispatch_calls.append((xh, received_packed, received_scales))
         return real_fused(xh, received_packed, received_scales)
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setenv("BONSAI_FUSED_GEMM", fused_gemm)
     monkeypatch.setenv("BONSAI_FUSED_GEMM_M64", "1")
     monkeypatch.setattr(bonsai_decode, "_ext", None, raising=True)
-    monkeypatch.setattr(
-        bonsai_decode, "_ext_error", unavailable, raising=True
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "_load_ext", fail_extension_load, raising=True
-    )
-    monkeypatch.setattr(
-        bonsai_ternary, "_load_ext", fail_extension_load, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_ext_error", unavailable, raising=True)
+    monkeypatch.setattr(bonsai_decode, "_load_ext", fail_extension_load, raising=True)
+    monkeypatch.setattr(bonsai_ternary, "_load_ext", fail_extension_load, raising=True)
     monkeypatch.setattr(
         bonsai_ternary, "q2b1_gemm_autotuned", record_fused, raising=True
     )
-    monkeypatch.setattr(
-        bonsai_decode, "_q2b1_gemm_op", fail_custom_op, raising=True
-    )
-    monkeypatch.setattr(
-        bonsai_decode, "_decode_lut_op", fail_custom_op, raising=True
-    )
+    monkeypatch.setattr(bonsai_decode, "_q2b1_gemm_op", fail_custom_op, raising=True)
+    monkeypatch.setattr(bonsai_decode, "_decode_lut_op", fail_custom_op, raising=True)
     monkeypatch.setattr(method, "_rotate", lambda value, signs: value.float())
 
     got = method.apply(layer, x)
@@ -1195,9 +1178,7 @@ def test_vllm_apply_compile_cached_unavailable_uses_dequant_fallback(
         (65, "1", False),
     ],
 )
-def test_vllm_apply_fused_dispatch_boundaries(
-    monkeypatch, M, m64_value, expect_fused
-):
+def test_vllm_apply_fused_dispatch_boundaries(monkeypatch, M, m64_value, expect_fused):
     if not torch.cuda.is_available():
         pytest.skip("cuda required")
     if torch.version.cuda is None:
@@ -1228,12 +1209,8 @@ def test_vllm_apply_fused_dispatch_boundaries(
         params_dtype=torch.bfloat16,
     )
     layer._bonsai_signs = method.signs.to("cuda")
-    layer._bonsai_packed = torch.zeros(
-        (N, K // 4), dtype=torch.uint8, device="cuda"
-    )
-    layer._bonsai_scales = torch.ones(
-        (N, K // 128), dtype=torch.float16, device="cuda"
-    )
+    layer._bonsai_packed = torch.zeros((N, K // 4), dtype=torch.uint8, device="cuda")
+    layer._bonsai_scales = torch.ones((N, K // 128), dtype=torch.float16, device="cuda")
     fused_calls = []
     fallback_calls = []
 
@@ -1285,8 +1262,10 @@ def test_gdn_out_projection_keeps_vllm_head_order():
     method.signs = torch.tensor(signs, dtype=torch.float32)
     x = torch.arange(6144, dtype=torch.float32).reshape(1, -1)
     expected = torch.cat(
-        [fwht_signs(x[:, start : start + 1024], torch.ones(1024))
-         for start in range(0, 6144, 1024)],
+        [
+            fwht_signs(x[:, start : start + 1024], torch.ones(1024))
+            for start in range(0, 6144, 1024)
+        ],
         dim=-1,
     )
 
@@ -1295,6 +1274,7 @@ def test_gdn_out_projection_keeps_vllm_head_order():
 
 def test_converter_unbiases_gemma_norm_weights():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_f32
 
     class Reader:
@@ -1313,6 +1293,7 @@ def test_converter_unbiases_gemma_norm_weights():
 
 def test_converter_restores_gdn_a_log():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_f32
 
     class Reader:
@@ -1335,6 +1316,7 @@ def test_converter_restores_gdn_a_log():
 
 def test_converter_preserves_gguf_bf16_matrix_row_order():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_bf16
 
     class Reader:
@@ -1358,6 +1340,7 @@ def test_converter_preserves_gguf_bf16_matrix_row_order():
 
 def test_converter_preserves_gguf_f32_matrix_row_order():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_f32
 
     class Reader:
@@ -1375,6 +1358,7 @@ def test_converter_preserves_gguf_f32_matrix_row_order():
 
 def test_converter_reorders_gdn_gate_head_order():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_bf16
 
     class Reader:
@@ -1391,12 +1375,18 @@ def test_converter_reorders_gdn_gate_head_order():
     )
 
     source_for_target = np.arange(48).reshape(3, 16).T.reshape(-1)
-    expected = torch.arange(48 * 4, dtype=torch.float32).reshape(48, 4)[source_for_target]
-    torch.testing.assert_close(out["model.layers.0.linear_attn.in_proj_a.weight"].float(), expected.to(torch.bfloat16).float())
+    expected = torch.arange(48 * 4, dtype=torch.float32).reshape(48, 4)[
+        source_for_target
+    ]
+    torch.testing.assert_close(
+        out["model.layers.0.linear_attn.in_proj_a.weight"].float(),
+        expected.to(torch.bfloat16).float(),
+    )
 
 
 def test_converter_reorders_gdn_scalar_head_order():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_f32
 
     class Reader:
@@ -1416,12 +1406,15 @@ def test_converter_reorders_gdn_scalar_head_order():
     )
     torch.testing.assert_close(
         out["model.layers.0.linear_attn.dt_bias"].float(),
-        torch.arange(48, dtype=torch.float32)[np.arange(48).reshape(3, 16).T.reshape(-1)],
+        torch.arange(48, dtype=torch.float32)[
+            np.arange(48).reshape(3, 16).T.reshape(-1)
+        ],
     )
 
 
 def test_converter_reorders_gdn_conv_channel_order():
     from types import SimpleNamespace
+
     from prism_bonsai_convert import convert_f32
 
     class Reader:
@@ -1448,10 +1441,12 @@ def test_converter_reorders_gdn_conv_channel_order():
 
 def test_converter_build_config_structure():
     import os
+
     if not os.path.exists(GGUF_PATH):
         pytest.skip("GGUF not present")
-    from prism_bonsai_convert import build_config, build_name_map
     from gguf_reader_min import GgufMinReader
+    from prism_bonsai_convert import build_config, build_name_map
+
     r = GgufMinReader(GGUF_PATH)
     cfg = build_config(r)
     assert cfg["architectures"] == ["Bonsai2ForCausalLM"]
@@ -1471,7 +1466,11 @@ def test_converter_build_config_structure():
     assert qc["hadamard_axis"] == "input-last-dimension"
     signs = qc["hadamard_signs"]
     assert set(signs) == {"5120", "6144", "17408"}
-    assert len(signs["5120"]) == 5120 and len(signs["6144"]) == 6144 and len(signs["17408"]) == 17408
+    assert (
+        len(signs["5120"]) == 5120
+        and len(signs["6144"]) == 6144
+        and len(signs["17408"]) == 17408
+    )
     assert set(np.unique(np.array(signs["5120"]))) <= {-1, 1}
     lt = cfg["layer_types"]
     assert len(lt) == 64
@@ -1492,9 +1491,11 @@ def test_converter_build_config_structure():
     assert cfg["torch_dtype"] == "bfloat16"
     assert cfg["attn_output_gate"] is True and cfg["output_gate_type"] == "swish"
 
+
 # ---------------------------------------------------------------------------
 # BonsaiTernaryLinearMethod (Task 7)
 # ---------------------------------------------------------------------------
+
 
 def _pack_q2b1(trits: torch.Tensor) -> torch.Tensor:
     # trits (N, K) int {-1,0,1} -> (N, K//4) uint8 LSB-first, per byte 4 slots
@@ -1509,10 +1510,14 @@ def _pack_q2b1(trits: torch.Tensor) -> torch.Tensor:
 def test_bonsai_ternary_linear_fp8_end_to_end():
     import torch
     from prism_pq2 import hadamard_matrix
+
     if not torch.cuda.is_available():
         pytest.skip("cuda")
     from vllm.model_executor.layers.quantization.bonsai_ternary import (
-        BonsaiTernaryConfig, BonsaiTernaryLinearMethod)
+        BonsaiTernaryConfig,
+        BonsaiTernaryLinearMethod,
+    )
+
     torch.manual_seed(0)
     K, N, M = 1024, 512, 3
     trits = torch.randint(-1, 2, (N, K), device="cuda")
@@ -1520,7 +1525,9 @@ def test_bonsai_ternary_linear_fp8_end_to_end():
     scale = (torch.rand(N, K // 128, device="cuda") + 0.5).to(torch.float16)
     signs = torch.tensor([-1.0, 1.0] * 512, device="cuda")
     lm = BonsaiTernaryLinearMethod(BonsaiTernaryConfig(ternary_target="fp8"), K, N)
-    lm.process_weights_after_loading({"packed": packed, "scale": scale}, signs, "cuda:0")
+    lm.process_weights_after_loading(
+        {"packed": packed, "scale": scale}, signs, "cuda:0"
+    )
     # memory check (small shapes): fp8 weights + fp32 grouped scales
     assert lm.weight_bytes() == K * N * 1 + N * (K // 128) * 4
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
@@ -1539,10 +1546,14 @@ def test_bonsai_ternary_linear_fp8_end_to_end():
 def test_bonsai_ternary_linear_int4_exactish():
     import torch
     from prism_pq2 import hadamard_matrix
+
     if not torch.cuda.is_available():
         pytest.skip("cuda")
     from vllm.model_executor.layers.quantization.bonsai_ternary import (
-        BonsaiTernaryConfig, BonsaiTernaryLinearMethod)
+        BonsaiTernaryConfig,
+        BonsaiTernaryLinearMethod,
+    )
+
     torch.manual_seed(1)
     K, N, M = 2048, 256, 2
     trits = torch.randint(-1, 2, (N, K), device="cuda")
@@ -1550,15 +1561,20 @@ def test_bonsai_ternary_linear_int4_exactish():
     scale = (torch.rand(N, K // 128, device="cuda") + 0.5).to(torch.float16)
     signs = torch.tensor([-1.0, 1.0] * 1024, device="cuda")
     lm = BonsaiTernaryLinearMethod(BonsaiTernaryConfig(ternary_target="int4"), K, N)
-    lm.process_weights_after_loading({"packed": packed, "scale": scale}, signs, "cuda:0")
+    lm.process_weights_after_loading(
+        {"packed": packed, "scale": scale}, signs, "cuda:0"
+    )
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     out = lm.apply(x)
     H = torch.from_numpy(hadamard_matrix(1024)).to("cuda")
     # block-hadamard: H + signs applied per 1024-block
     xh = torch.empty_like(x, dtype=torch.float64)
     for b in range(K // 1024):
-        xb = x.double()[:, b*1024:(b+1)*1024] * signs[b*1024:(b+1)*1024].double()
-        xh[:, b*1024:(b+1)*1024] = xb @ torch.from_numpy(hadamard_matrix(1024)).double().to("cuda").T
+        xb = (
+            x.double()[:, b * 1024 : (b + 1) * 1024]
+            * signs[b * 1024 : (b + 1) * 1024].double()
+        )
+        xh[:, b * 1024 : (b + 1) * 1024] = xb @ H.double().T
     w_dq = trits.double() * scale.double().repeat_interleave(128, dim=1)
     ref = xh @ w_dq.T
     torch.testing.assert_close(out.float(), ref.float(), rtol=0.05, atol=0.2)
@@ -1566,9 +1582,13 @@ def test_bonsai_ternary_linear_int4_exactish():
 
 def test_bonsai_ternary_auto_blackwell():
     import torch
+
     if not torch.cuda.is_available():
         pytest.skip("cuda")
-    from vllm.model_executor.layers.quantization.bonsai_ternary import BonsaiTernaryConfig
+    from vllm.model_executor.layers.quantization.bonsai_ternary import (
+        BonsaiTernaryConfig,
+    )
+
     cfg = BonsaiTernaryConfig(ternary_target="auto")
     if torch.cuda.get_device_capability()[0] >= 12:
         assert cfg.resolve() == "nvfp4"

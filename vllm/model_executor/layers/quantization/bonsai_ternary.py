@@ -25,9 +25,9 @@ Hadamard rotation: y = (x*signs @ H^T) @ W^T where H is the normalized
 the signs+FWHT is applied per 1024-block (each block of x uses its own slice
 of signs), matching the block-diagonal rotation of the checkpoint format.
 """
+
 import os
 from contextlib import suppress
-from typing import Dict, List, Optional
 
 import torch
 
@@ -64,22 +64,24 @@ class BonsaiTernaryConfig:
 class BonsaiTernaryLinearMethod:
     """Hadamard-rotated ternary Linear: y = (x*signs @ H^T) @ W^T."""
 
-    def __init__(self, config: BonsaiTernaryConfig, in_features: int,
-                 out_features: int):
+    def __init__(
+        self, config: BonsaiTernaryConfig, in_features: int, out_features: int
+    ):
         self.config = config
         self.in_features = in_features
         self.out_features = out_features
-        self._target: Optional[str] = None
-        self.signs: Optional[torch.Tensor] = None
-        self.w_dq_bf16: Optional[torch.Tensor] = None
-        self.w_target: Optional[torch.Tensor] = None
-        self.w_scales: Optional[torch.Tensor] = None
+        self._target: str | None = None
+        self.signs: torch.Tensor | None = None
+        self.w_dq_bf16: torch.Tensor | None = None
+        self.w_target: torch.Tensor | None = None
+        self.w_scales: torch.Tensor | None = None
         self._n_weight_bytes = 0
 
     @property
     def target(self) -> str:
         assert self._target is not None, (
-            "process_weights_after_loading has not been called")
+            "process_weights_after_loading has not been called"
+        )
         return self._target
 
     def weight_bytes(self) -> int:
@@ -88,70 +90,81 @@ class BonsaiTernaryLinearMethod:
 
     def process_weights_after_loading(
         self,
-        weights: Dict[str, torch.Tensor],
+        weights: dict[str, torch.Tensor],
         signs: torch.Tensor,
         device,
     ) -> None:
         target = self.config.resolve()
         if target == "nvfp4":
-            raise NotImplementedError(
-                "nvfp4 ternary target lands in a later task")
+            raise NotImplementedError("nvfp4 ternary target lands in a later task")
         K, N = self.in_features, self.out_features
         assert K % _HADAMARD_BLOCK == 0, (
-            "in_features must be a multiple of the 1024 Hadamard block")
+            "in_features must be a multiple of the 1024 Hadamard block"
+        )
         assert K % _SCALE_GROUP == 0, "in_features must be divisible by 128"
 
         packed = weights["packed"].to(device)
         scale = weights["scale"].to(device)
         assert packed.shape == (N, K // 4) and packed.dtype == torch.uint8, (
-            f"packed weights must be uint8 (N, K//4), got {packed.shape} "
-            f"{packed.dtype}")
+            f"packed weights must be uint8 (N, K//4), got {packed.shape} {packed.dtype}"
+        )
         assert scale.shape == (N, K // 128) and scale.dtype == torch.float16, (
-            f"scales must be fp16 (N, K//128), got {scale.shape} {scale.dtype}")
+            f"scales must be fp16 (N, K//128), got {scale.shape} {scale.dtype}"
+        )
 
         # decode_trits consumes flat uint8 bytes -> (n, 4) int8 trits
         # (LSB-first, 4 slots per byte); reshape back to (N, K//4, 4) then
         # (N, K) to undo the packing.
-        trits = decode_trits(packed.reshape(-1)).reshape(N, K // 4,
-                                                         4).reshape(N, K)
+        trits = decode_trits(packed.reshape(-1)).reshape(N, K // 4, 4).reshape(N, K)
 
         self.signs = signs.to(device=device, dtype=torch.float32).flatten()
-        assert self.signs.shape == (K, )
+        assert self.signs.shape == (K,)
 
         if target == "fp8":
-            w_f = trits.float() * scale.float().repeat_interleave(
-                _SCALE_GROUP, dim=-1)
+            w_f = trits.float() * scale.float().repeat_interleave(_SCALE_GROUP, dim=-1)
             groups = w_f.reshape(N, K // _SCALE_GROUP, _SCALE_GROUP)
             amax = groups.abs().amax(dim=-1).clamp(min=1e-12)
-            w_target = (groups / amax.unsqueeze(-1)).reshape(N, K).to(
-                torch.float8_e4m3fn)
+            w_target = (
+                (groups / amax.unsqueeze(-1)).reshape(N, K).to(torch.float8_e4m3fn)
+            )
             self.w_target = w_target
             self.w_scales = amax  # fp32 (N, K//128)
             # First-pass correctness implementation: cache the dequantized
             # bf16 weights so apply() can use a plain matmul.  A
             # grouped-scale fp8 GEMM (no bf16 dequant resident) is Task 9.
-            self.w_dq_bf16 = (w_target.float().view(
-                N, K // _SCALE_GROUP, _SCALE_GROUP) *
-                amax.unsqueeze(-1)).view(N, K).to(torch.bfloat16)
-            self._n_weight_bytes = (w_target.numel() *
-                                    w_target.element_size() +
-                                    amax.numel() * amax.element_size())
+            self.w_dq_bf16 = (
+                (
+                    w_target.float().view(N, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * amax.unsqueeze(-1)
+                )
+                .view(N, K)
+                .to(torch.bfloat16)
+            )
+            self._n_weight_bytes = (
+                w_target.numel() * w_target.element_size()
+                + amax.numel() * amax.element_size()
+            )
         else:
             # int4/int8: exact int8 trits + fp32 grouped scales.  Marlin
             # int4 packing lands in Task 9; the int4 target currently uses
             # the exact trits with a W4A16-style dequant matmul.
             self.w_target = trits.to(torch.int8)
             self.w_scales = scale.float()  # fp32 (N, K//128)
-            self.w_dq_bf16 = (self.w_target.float().view(
-                N, K // _SCALE_GROUP, _SCALE_GROUP) *
-                self.w_scales.unsqueeze(-1)).view(N, K).to(torch.bfloat16)
-            self._n_weight_bytes = (self.w_target.numel() *
-                                    self.w_target.element_size() +
-                                    self.w_scales.numel() *
-                                    self.w_scales.element_size())
+            self.w_dq_bf16 = (
+                (
+                    self.w_target.float().view(N, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * self.w_scales.unsqueeze(-1)
+                )
+                .view(N, K)
+                .to(torch.bfloat16)
+            )
+            self._n_weight_bytes = (
+                self.w_target.numel() * self.w_target.element_size()
+                + self.w_scales.numel() * self.w_scales.element_size()
+            )
         self._target = target
 
-    def _hadamard_blocks(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def _hadamard_blocks(self, x: torch.Tensor) -> list[torch.Tensor]:
         """x: (M, K) fp32 -> per-1024-block H @ (signs * x_b), concatenated.
 
         Each block b uses its own signs slice, matching the block-diagonal
@@ -159,16 +172,18 @@ class BonsaiTernaryLinearMethod:
         """
         nb = self.in_features // _HADAMARD_BLOCK
         outs = [
-            fwht_signs(x[:, b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK],
-                       self.signs[b * _HADAMARD_BLOCK:(b + 1) *
-                                  _HADAMARD_BLOCK])
+            fwht_signs(
+                x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK],
+                self.signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK],
+            )
             for b in range(nb)
         ]
         return outs if nb > 1 else [outs[0]]
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         assert self._target is not None, (
-            "process_weights_after_loading has not been called")
+            "process_weights_after_loading has not been called"
+        )
         assert x.dim() == 2 and x.shape[1] == self.in_features
         M, K = x.shape
 
@@ -180,14 +195,21 @@ class BonsaiTernaryLinearMethod:
             for b in range(K // _HADAMARD_BLOCK):
                 b0 = b * _HADAMARD_BLOCK
                 q, amax = fwht_signs_quant_fp8(
-                    x.float()[:, b0:b0 + _HADAMARD_BLOCK],
-                    self.signs[b0:b0 + _HADAMARD_BLOCK])
+                    x.float()[:, b0 : b0 + _HADAMARD_BLOCK],
+                    self.signs[b0 : b0 + _HADAMARD_BLOCK],
+                )
                 qs.append(q)
                 amaxes.append(amax)
-            q = torch.cat(qs, dim=-1)          # (M, K) fp8
-            amax = torch.cat(amaxes, dim=-1)   # (M, K//128) fp32
-            x_dq = (q.float().view(M, K // _SCALE_GROUP, _SCALE_GROUP) *
-                    amax.unsqueeze(-1)).view(M, K).to(torch.bfloat16)
+            q = torch.cat(qs, dim=-1)  # (M, K) fp8
+            amax = torch.cat(amaxes, dim=-1)  # (M, K//128) fp32
+            x_dq = (
+                (
+                    q.float().view(M, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * amax.unsqueeze(-1)
+                )
+                .view(M, K)
+                .to(torch.bfloat16)
+            )
             return torch.matmul(x_dq, self.w_dq_bf16.t())
         # W4A16-style dequant matmul: xh stays fp32 out of the FWHT, the
         # bf16 dequantized weights are upcast for the matmul (fp32
@@ -199,14 +221,16 @@ class BonsaiTernaryLinearMethod:
 # ---------------------------------------------------------------------------
 # vLLM integration: QuantizationConfig + LinearMethodBase
 # ---------------------------------------------------------------------------
-from torch.nn import Parameter
+from torch.nn import Parameter  # noqa: E402
 
-from vllm.model_executor.layers.linear import (
+from vllm.model_executor.layers.linear import (  # noqa: E402
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
+    QuantizationConfig,
+)
+from vllm.model_executor.utils import set_weight_attrs  # noqa: E402
 
 
 class BonsaiTernaryQuantConfig(QuantizationConfig):
@@ -223,9 +247,9 @@ class BonsaiTernaryQuantConfig(QuantizationConfig):
     def __init__(
         self,
         ternary_target: str = "auto",
-        hadamard_signs: Optional[Dict[str, List[int]]] = None,
-        hadamard_folded: Optional[List[str]] = None,
-        hadamard_inverse: Optional[List[str]] = None,
+        hadamard_signs: dict[str, list[int]] | None = None,
+        hadamard_folded: list[str] | None = None,
+        hadamard_inverse: list[str] | None = None,
         gdn_v_grouped: bool = False,
     ):
         super().__init__()
@@ -267,7 +291,7 @@ class BonsaiTernaryQuantConfig(QuantizationConfig):
         return "bonsai_ternary"
 
     @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.bfloat16, torch.float16]
 
     @classmethod
@@ -275,7 +299,7 @@ class BonsaiTernaryQuantConfig(QuantizationConfig):
         return 80
 
     @staticmethod
-    def get_config_filenames() -> List[str]:
+    def get_config_filenames() -> list[str]:
         return []
 
     @classmethod
@@ -314,13 +338,13 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         self.quant_config = quant_config
         self.prefix = prefix
         self.is_inverse = prefix in quant_config.hadamard_inverse
-        self.signs: Optional[torch.Tensor] = None
+        self.signs: torch.Tensor | None = None
 
     def create_weights(
         self,
         layer: torch.nn.Module,
         input_size_per_partition: int,
-        output_partition_sizes: List[int],
+        output_partition_sizes: list[int],
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
@@ -352,7 +376,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         # Standard (out, in) orientation: PQ2_0's 128-weight groups run
         # along the input dim and each checkpoint row is an output feature.
-        base_attrs: Dict[str, object] = {"input_dim": 1, "output_dim": 0}
+        base_attrs: dict[str, object] = {"input_dim": 1, "output_dim": 0}
         # Linear and vocab layers both need their shard-aware loader so packed
         # rows are sliced on the logical output dimension.
         if weight_loader is not None:
@@ -368,18 +392,14 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         layer.register_buffer(
             "_bonsai_signs", signs.to(packed.device), persistent=False
         )
-        set_weight_attrs(
-            packed, dict(base_attrs, packed_dim=1, packed_factor=4)
-        )
+        set_weight_attrs(packed, dict(base_attrs, packed_dim=1, packed_factor=4))
         layer.register_parameter("weight", packed)
 
         scale = Parameter(
             torch.empty(out_features, in_features // 128, dtype=torch.float16),
             requires_grad=False,
         )
-        set_weight_attrs(
-            scale, dict(base_attrs, packed_dim=1, packed_factor=128)
-        )
+        set_weight_attrs(scale, dict(base_attrs, packed_dim=1, packed_factor=128))
         layer.register_parameter("weight_scale", scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -400,9 +420,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
                     and not torch.compiler.is_compiling()
                 ):
                     # Up to seven buckets cost 21 timed candidates per unique N/K shape.
-                    prewarm_q2b1_autotune(
-                        packed, scale, prewarm_m_values
-                    )
+                    prewarm_q2b1_autotune(packed, scale, prewarm_m_values)
             except BonsaiQ2b1UnavailableError:
                 pass
         signs = layer._bonsai_signs
@@ -414,15 +432,13 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         layer._bonsai_scales = scale
 
     @staticmethod
-    def _dequant_rows(
-        packed: torch.Tensor, scales: torch.Tensor
-    ) -> torch.Tensor:
+    def _dequant_rows(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """Decode a packed row chunk to bf16 (bounded memory).
 
         packed: (m, K//4) uint8, scales: (m, K//128) fp16 -> (m, K) bf16.
         """
         m, k4 = packed.shape
-        trits: Optional[torch.Tensor] = None
+        trits: torch.Tensor | None = None
         if packed.device.type != "cpu":
             with suppress(BonsaiQ2b1UnavailableError):
                 trits = (
@@ -439,7 +455,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
     _APPLY_ROW_CHUNK = 16384  # bounds dequantized output-row transients
 
     def _resolve_signs(
-        self, x: torch.Tensor, signs: Optional[torch.Tensor]
+        self, x: torch.Tensor, signs: torch.Tensor | None
     ) -> torch.Tensor:
         signs = self.signs if signs is None else signs
         assert signs is not None
@@ -452,9 +468,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
             signs = signs.to(x.device)
         return signs
 
-    def _layer_signs(
-        self, layer: torch.nn.Module, x: torch.Tensor
-    ) -> torch.Tensor:
+    def _layer_signs(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         signs = getattr(layer, "_bonsai_signs", self.signs)
         if signs is None:
             raise RuntimeError("Bonsai Hadamard signs are not initialized")
@@ -470,7 +484,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         return signs
 
     def _rotate(
-        self, x: torch.Tensor, signs: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, signs: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Forward activation transform: y = H @ (signs * x) per block."""
         signs = self._resolve_signs(x, signs)
@@ -482,9 +496,9 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         nb = k // _HADAMARD_BLOCK
         outs = []
         for b in range(nb):
-            s = signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK]
+            s = signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK]
             outs.append(
-                fwht_signs(x[:, b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK], s)
+                fwht_signs(x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK], s)
             )
         return torch.cat(outs, dim=-1) if nb > 1 else outs[0]
 
@@ -492,7 +506,7 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Standard layout: y = x @ W.T with W (out, in).
         xh = self._rotate(x, self._layer_signs(layer, x)).float()
@@ -522,15 +536,11 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
                 return out
 
         n = packed.shape[0]
-        out = torch.empty(
-            (xh.shape[0], n), dtype=torch.bfloat16, device=xh.device
-        )
+        out = torch.empty((xh.shape[0], n), dtype=torch.bfloat16, device=xh.device)
         chunk = self._APPLY_ROW_CHUNK
         for r0 in range(0, n, chunk):
             r1 = min(r0 + chunk, n)
-            w = self._dequant_rows(
-                packed[r0:r1], scales[r0:r1]
-            )
+            w = self._dequant_rows(packed[r0:r1], scales[r0:r1])
             out[:, r0:r1] = (xh @ w.float().transpose(0, 1)).to(torch.bfloat16)
         if bias is not None:
             out = out + bias
@@ -551,14 +561,12 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
             layer._bonsai_scales[flat_idx],
         )
         if self.is_inverse:
-            x = self._inverse_rotate(
-                x, self._layer_signs(layer, x)
-            )
+            x = self._inverse_rotate(x, self._layer_signs(layer, x))
             return x.reshape(*idx.shape, -1)
         return x.reshape(*idx.shape, -1)
 
     def _inverse_rotate(
-        self, x: torch.Tensor, signs: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, signs: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Latent lookup restore: x = signs * (H @ row) per block."""
         signs = self._resolve_signs(x, signs)
@@ -567,8 +575,8 @@ class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
         ones = torch.ones(_HADAMARD_BLOCK, device=x.device, dtype=torch.float32)
         outs = []
         for b in range(nb):
-            h = fwht_signs(x[:, b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK], ones)
-            s = signs[b * _HADAMARD_BLOCK:(b + 1) * _HADAMARD_BLOCK]
+            h = fwht_signs(x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK], ones)
+            s = signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK]
             outs.append(h * s)
         y = torch.cat(outs, dim=-1) if nb > 1 else outs[0]
         return y.to(x.dtype)

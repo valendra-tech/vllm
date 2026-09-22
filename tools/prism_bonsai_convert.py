@@ -10,6 +10,7 @@ prism.hadamard metadata of this GGUF):
   threshold (d is a dequantization scale, not the decision boundary), so the
   converter preserves trits and scales byte-exactly instead of re-quantizing.
 """
+
 import argparse
 import json
 import os
@@ -120,12 +121,20 @@ def build_name_map(reader):
                 continue
             raise ValueError(f"unrecognized tensor name: {info.name}")
         n, suffix = int(m.group(1)), m.group(2)
-        layer_type = "full_attention" if n % interval == interval - 1 else "linear_attention"
+        layer_type = (
+            "full_attention" if n % interval == interval - 1 else "linear_attention"
+        )
         suffix_map = _COMMON_SUFFIX_MAP
         if suffix in _FULL_ATTN_SUFFIX_MAP or suffix in _LINEAR_ATTN_SUFFIX_MAP:
-            suffix_map = _FULL_ATTN_SUFFIX_MAP if layer_type == "full_attention" else _LINEAR_ATTN_SUFFIX_MAP
+            suffix_map = (
+                _FULL_ATTN_SUFFIX_MAP
+                if layer_type == "full_attention"
+                else _LINEAR_ATTN_SUFFIX_MAP
+            )
             if suffix not in suffix_map:
-                raise ValueError(f"tensor {info.name} not valid for {layer_type} layer {n}")
+                raise ValueError(
+                    f"tensor {info.name} not valid for {layer_type} layer {n}"
+                )
         if suffix not in suffix_map:
             raise ValueError(f"unrecognized layer tensor name: {info.name}")
         mapping[info.name] = f"model.layers.{n}.{suffix_map[suffix]}"
@@ -135,13 +144,14 @@ def build_name_map(reader):
 def pack_q2b1_codes(trits):
     """Pack int8 trits {-1,0,1} shaped (n, m), m%4==0, into Q2b1 bytes (n, m//4).
 
-    Q2b1 slot, LSB-first: weight j -> byte j//4, bits (j%4)*2; -1->0b10, 0->0b00, +1->0b01.
+    Q2b1 slot, LSB-first: weight j -> byte j//4, bits (j%4)*2;
+    -1->0b10, 0->0b00, +1->0b01.
     """
     trits = np.asarray(trits, dtype=np.int8)
     n, m = trits.shape
     if m % 4 != 0:
         raise ValueError(f"input width {m} not a multiple of 4")
-    codes = TRIT_TO_Q2B1_CODE[trits + 1]                      # (n, m) uint8 in {0,1,2}
+    codes = TRIT_TO_Q2B1_CODE[trits + 1]  # (n, m) uint8 in {0,1,2}
     bits = codes.reshape(n, m // 4, 4) << np.uint8([0, 2, 4, 6])
     packed = bits[..., 0] | bits[..., 1] | bits[..., 2] | bits[..., 3]
     return np.ascontiguousarray(packed, dtype=np.uint8)
@@ -162,9 +172,13 @@ def decode_pq2_tensor_trits(reader, info):
     d = blocks[:, :2].copy().view(np.float16).reshape(ne1, n_groups)
     qs = blocks[:, 2:]
     shifts = np.uint8(2 * np.arange(4, dtype=np.uint8))
-    codes = ((qs.reshape(n_blocks, 32, 1) >> shifts) & np.uint8(3)).reshape(n_blocks, 128)
+    codes = ((qs.reshape(n_blocks, 32, 1) >> shifts) & np.uint8(3)).reshape(
+        n_blocks, 128
+    )
     if (codes == 3).any():
-        raise ValueError(f"PQ2_0 code 3 (+2) found in {info.name}: not a ternary tensor")
+        raise ValueError(
+            f"PQ2_0 code 3 (+2) found in {info.name}: not a ternary tensor"
+        )
     trits = PQ2_CODE_TO_TRIT[codes]  # (n_blocks, 128) int8
     return np.ascontiguousarray(trits.reshape(ne1, ne0)), d
 
@@ -208,12 +222,11 @@ def _fuse_gdn_qkvz_tensors(tensors):
 def convert_f32(reader, info, hf_name, out):
     shape = tuple(reversed(info.dims)) if len(info.dims) == 2 else info.dims
     arr = np.frombuffer(reader.tensor_data(info), np.float32).copy().reshape(shape)
-    if arr.ndim == 2:
-        if hf_name.endswith("linear_attn.conv1d.weight"):
-            # Checkpoint layout is (conv_dim, 1, kernel); the GDN module's
-            # depthwise Conv1d expects the singleton channel dim.
-            arr = _reorder_gdn_value_channels(arr)
-            arr = arr[:, None, :]
+    if arr.ndim == 2 and hf_name.endswith("linear_attn.conv1d.weight"):
+        # Checkpoint layout is (conv_dim, 1, kernel); the GDN module's
+        # depthwise Conv1d expects the singleton channel dim.
+        arr = _reorder_gdn_value_channels(arr)
+        arr = arr[:, None, :]
     if hf_name.endswith(_GEMMA_NORM_SUFFIXES):
         # GGUF/llama.cpp stores Qwen3.5's effective RMSNorm weight, while
         # vLLM's GemmaRMSNorm stores the zero-centered value and adds 1.
@@ -256,18 +269,19 @@ def convert_tensor(reader, info, hf_name, out):
 
 
 def build_config(reader):
-    kv = reader.kv
     widths = reader.get_i32s("prism.hadamard.sign_widths")
     values = reader.get_i32s("prism.hadamard.sign_values")
     signs, pos = {}, 0
     for w in widths:
-        signs[str(w)] = values[pos:pos + w]
+        signs[str(w)] = values[pos : pos + w]
         pos += w
     if pos != len(values):
         raise ValueError("hadamard sign_values length does not match sign_widths")
     name_map = build_name_map(reader)
     folded = [name_map[n] for n in reader.get_strs("prism.hadamard.weight_names")]
-    inverse = [name_map[n] for n in reader.get_strs("prism.hadamard.inverse_weight_names")]
+    inverse = [
+        name_map[n] for n in reader.get_strs("prism.hadamard.inverse_weight_names")
+    ]
     n_layers = reader.get_i32("qwen35.block_count")
     interval = reader.get_i32("qwen35.full_attention_interval")
     if n_layers % interval != 0:
@@ -349,17 +363,21 @@ def export_tokenizer(reader, out_dir):
     try:
         from transformers import AutoTokenizer
     except Exception as exc:  # pragma: no cover - environment dependent
-        raise RuntimeError("tokenizer export failed: transformers is unavailable") from exc
+        raise RuntimeError(
+            "tokenizer export failed: transformers is unavailable"
+        ) from exc
     try:
         tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B")
     except Exception as exc:  # pragma: no cover - network dependent
-        raise RuntimeError("tokenizer export failed: could not load Qwen/Qwen3.8-27B") from exc
+        raise RuntimeError(
+            "tokenizer export failed: could not load Qwen/Qwen3.8-27B"
+        ) from exc
     ggml_tokens = reader.get_strs("tokenizer.ggml.tokens")
     spot_ids = [0, 1, 42, 248044, 248046]
     spot_ok = all(tok.convert_ids_to_tokens(i) == ggml_tokens[i] for i in spot_ids)
     added = 0
     if len(tok) < len(ggml_tokens) and spot_ok:
-        extra_tokens = ggml_tokens[len(tok):]
+        extra_tokens = ggml_tokens[len(tok) :]
         added = tok.add_tokens(extra_tokens, special_tokens=True)
         for attr, token_id in (
             ("bos_token", GENERATION_CONFIG["bos_token_id"]),
@@ -407,7 +425,9 @@ def export_tokenizer(reader, out_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert Prism Bonsai2 PQ2_0 GGUF to HF safetensors")
+    ap = argparse.ArgumentParser(
+        description="Convert Prism Bonsai2 PQ2_0 GGUF to HF safetensors"
+    )
     ap.add_argument("gguf")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -422,12 +442,15 @@ def main():
         hf_name = name_map[info.name]
         convert_tensor(reader, info, hf_name, tensors)
         if (i + 1) % 50 == 0 or i + 1 == len(reader.tensors):
-            print(f"[convert] {i + 1}/{len(reader.tensors)} ({info.name} -> {hf_name}) "
-                  f"elapsed {time.time() - t_start:.1f}s")
+            print(
+                f"[convert] {i + 1}/{len(reader.tensors)} ({info.name} -> {hf_name}) "
+                f"elapsed {time.time() - t_start:.1f}s"
+            )
 
     os.makedirs(args.out, exist_ok=True)
     st_path = os.path.join(args.out, "model.safetensors")
     from safetensors.torch import save_file
+
     save_file(tensors, st_path, metadata={"format": "pt"})
     del tensors
     st_bytes = os.path.getsize(st_path)
@@ -438,7 +461,10 @@ def main():
         json.dump(cfg, f, indent=2)
     with open(os.path.join(args.out, "generation_config.json"), "w") as f:
         json.dump(GENERATION_CONFIG, f, indent=2)
-    print(f"[save] config.json + generation_config.json written ({len(cfg['quantization_config']['hadamard_folded'])} folded names)")
+    print(
+        f"[save] config.json + generation_config.json written "
+        f"({len(cfg['quantization_config']['hadamard_folded'])} folded names)"
+    )
 
     export_tokenizer(reader, args.out)
     print(f"[done] model.safetensors {st_bytes} bytes in {time.time() - t_start:.1f}s")

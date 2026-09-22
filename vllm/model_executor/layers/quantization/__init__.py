@@ -133,8 +133,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         deepseek_config = DeepseekV4FP8Config
 
     from .auto_awq import AutoAWQConfig
-    from .bonsai_ternary import BonsaiTernaryQuantConfig
     from .auto_gptq import AutoGPTQConfig
+    from .bonsai_ternary import BonsaiTernaryQuantConfig
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )

@@ -8,9 +8,9 @@ import argparse
 import math
 import os
 import statistics
+import sys
 from collections.abc import Callable
 from pathlib import Path
-import sys
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -75,9 +75,7 @@ def require_supported_cuda():
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "PyTorch is required to check CUDA availability"
-        ) from exc
+        raise RuntimeError("PyTorch is required to check CUDA availability") from exc
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required, but no CUDA device is available")
@@ -103,18 +101,14 @@ def baseline_gemm(x, packed, scales, decode_trits):
         trits = decode_trits(packed[row_start:row_end].reshape(-1)).reshape(
             row_end - row_start, k
         )
-        grouped_scales = scales[row_start:row_end].float().repeat_interleave(
-            128, dim=1
-        )
+        grouped_scales = scales[row_start:row_end].float().repeat_interleave(128, dim=1)
         weights = trits.float()
         weights.mul_(grouped_scales)
         output[:, row_start:row_end] = x @ weights.t()
     return output
 
 
-def measure_first_call(
-    fn: Callable[[], object], device
-) -> tuple[float, object]:
+def measure_first_call(fn: Callable[[], object], device) -> tuple[float, object]:
     import torch
 
     stream = torch.cuda.current_stream(device)
@@ -144,9 +138,7 @@ def measure_steady_state(
         end.record(stream)
     ends[-1].synchronize()
 
-    timings_ms = [
-        start.elapsed_time(end) for start, end in zip(starts, ends)
-    ]
+    timings_ms = [start.elapsed_time(end) for start, end in zip(starts, ends)]
     return statistics.median(timings_ms), statistics.fmean(timings_ms)
 
 
@@ -187,12 +179,15 @@ def main() -> None:
         device=device,
         generator=generator,
     )
-    scales = torch.rand(
-        (args.n, args.k // 128),
-        dtype=torch.float16,
-        device=device,
-        generator=generator,
-    ) + 0.5
+    scales = (
+        torch.rand(
+            (args.n, args.k // 128),
+            dtype=torch.float16,
+            device=device,
+            generator=generator,
+        )
+        + 0.5
+    )
     x = torch.randn(
         (args.m, args.k),
         dtype=torch.float32,
@@ -211,9 +206,7 @@ def main() -> None:
         # Load the extension before measuring autotune so JIT compilation does
         # not get conflated with the configuration-selection cost.
         extension_first_ms, _ = measure_first_call(
-            lambda: bonsai_decode.q2b1_gemm(
-                x, packed, scales, config_id=0
-            ),
+            lambda: bonsai_decode.q2b1_gemm(x, packed, scales, config_id=0),
             device,
         )
         bonsai_decode._AUTOTUNE_CACHE.clear()
@@ -231,13 +224,9 @@ def main() -> None:
     baseline_ms, baseline_avg_ms = measure_steady_state(
         run_baseline, args.iters, device
     )
-    fused_ms, fused_avg_ms = measure_steady_state(
-        run_fused, args.iters, device
-    )
+    fused_ms, fused_avg_ms = measure_steady_state(run_fused, args.iters, device)
     selected_config = (
-        next(iter(bonsai_decode._AUTOTUNE_CACHE.values()))
-        if args.autotune
-        else 0
+        next(iter(bonsai_decode._AUTOTUNE_CACHE.values())) if args.autotune else 0
     )
 
     baseline_output = run_baseline()

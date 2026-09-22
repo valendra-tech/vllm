@@ -8,7 +8,6 @@ byte-level BPE tokenizer, and runs one generation through the vLLM engine.
 """
 
 import json
-import os
 
 import pytest
 import torch
@@ -167,7 +166,5 @@ def test_tiny_bonsai2_generates(tmp_path):
         quantization="bonsai_ternary",
         dtype="bfloat16",
     )
-    out = llm.generate(
-        ["hello world"], SamplingParams(max_tokens=8, temperature=0)
-    )
+    out = llm.generate(["hello world"], SamplingParams(max_tokens=8, temperature=0))
     assert out and len(out[0].outputs[0].token_ids) > 0

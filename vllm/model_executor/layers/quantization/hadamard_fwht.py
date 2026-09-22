@@ -20,14 +20,13 @@ Two implementations are provided:
   store.
 """
 
-from typing import Tuple
-
 import torch
 
 # Triton is optional at import time; the torch path is always available.
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -36,10 +35,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fwht_signs_kernel(
-        x_ptr,          # (M, 1024) input, any float dtype
-        signs_ptr,      # (1024,) float32 (+1 or -1)
-        y_ptr,          # (M, 1024) float32 output
-        BLOCK: tl.constexpr,       # 1024
+        x_ptr,  # (M, 1024) input, any float dtype
+        signs_ptr,  # (1024,) float32 (+1 or -1)
+        y_ptr,  # (M, 1024) float32 output
+        BLOCK: tl.constexpr,  # 1024
         NUM_STAGES: tl.constexpr,  # 10
     ):
         """One program per row: register-resident FWHT via tl.gather.
@@ -70,7 +69,7 @@ if _HAS_TRITON:
         tl.store(y_ptr + pid * BLOCK + idx, v * (1.0 / 32.0))
 
     def fwht_signs_triton(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
-        """y = H @ (signs * x) via a single Triton kernel launch.
+        """Y = H @ (signs * x) via a single Triton kernel launch.
 
         x: (..., 1024) float32/bf16 on cuda.  signs: (1024,) float (+/-1).
         Returns (..., 1024) float32.
@@ -82,8 +81,12 @@ if _HAS_TRITON:
         x2 = x.reshape(M, 1024).contiguous()
         y = torch.empty(M, 1024, dtype=torch.float32, device=x.device)
         _fwht_signs_kernel[(M,)](
-            x2, signs.float().contiguous(), y,
-            BLOCK=1024, NUM_STAGES=10, num_warps=4,
+            x2,
+            signs.float().contiguous(),
+            y,
+            BLOCK=1024,
+            NUM_STAGES=10,
+            num_warps=4,
         )
         return y.view(x.shape)
 
@@ -107,11 +110,11 @@ def _fwht_signs_torch(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
         x[..., 0, :] = a + b
         x[..., 1, :] = a - b
         h *= 2
-    return (x.view(M, n) * (1.0 / (n ** 0.5))).reshape(original_shape)
+    return (x.view(M, n) * (1.0 / (n**0.5))).reshape(original_shape)
 
 
 def fwht_signs(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
-    """y = H @ (signs * x) for block=1024, float32 output.
+    """Y = H @ (signs * x) for block=1024, float32 output.
 
     x: (..., 1024) float32/bf16 cuda (works on cpu too).  signs: (1024,).
     """
@@ -122,7 +125,7 @@ def fwht_signs(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
 
 def fwht_signs_quant_fp8(
     x: torch.Tensor, signs: torch.Tensor, group: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """FWHT with signs followed by per-group amax fp8 (e4m3) quantization.
 
     x: (..., 1024); signs: (1024,).  Returns (q, amax) where q is
