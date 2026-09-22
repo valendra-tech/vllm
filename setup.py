@@ -1408,13 +1408,16 @@ if _is_cuda():
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
     ):
         ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
+    if USE_PRECOMPILED_EXTENSIONS or (
+        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
+    ):
+        # DeepGEMM requires CUDA 12.9+ for the supported SM90/SM100 paths.
+        # Optional since it won't build on unsupported architectures.
+        ext_modules.append(CMakeExtension(name="vllm._deep_gemm_C", optional=True))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
-        # DeepGEMM requires CUDA 12.3+ (SM90/SM100)
-        # Optional since it won't build on unsupported architectures
-        # VAL-598: DeepGEMM requires CUDA 12.9+ (driver 570/CUDA 12.8 build host);
-        # keep qutlass (SM120 NVFP4) but drop the DeepGEMM target.
+        # Keep QuTLASS available independently of the DeepGEMM gate.
         ext_modules.append(CMakeExtension(name="vllm._qutlass_C", optional=True))
     # fmha_sm100 is a Python/CuTe-DSL package installed into vllm.third_party.
     ext_modules.append(CMakeExtension(name="vllm.fmha_sm100", optional=True))

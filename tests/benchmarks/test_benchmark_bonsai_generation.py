@@ -72,35 +72,88 @@ def test_parse_args_rejects_invalid_batch_controls(monkeypatch, capsys, option, 
     assert "positive" in capsys.readouterr().err
 
 
-def test_peak_memory_allocated_mb_converts_torch_peak_bytes_to_mb():
-    assert hasattr(benchmark, "peak_memory_allocated_mb")
-    fake_torch_cuda = SimpleNamespace(
-        is_available=lambda: True,
-        max_memory_allocated=lambda: 3 * 1024 * 1024 + 512 * 1024,
+def test_read_gpu_memory_used_mb_returns_max_nvidia_smi_value():
+    def run(command, **kwargs):
+        assert command == [
+            "nvidia-smi",
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ]
+        assert kwargs == {"check": True, "capture_output": True, "text": True}
+        return SimpleNamespace(stdout="123\n456\n")
+
+    assert benchmark.read_gpu_memory_used_mb(run=run) == pytest.approx(456.0)
+
+
+@pytest.mark.parametrize("memory_value", ["nan", "inf", "-inf"])
+def test_read_gpu_memory_used_mb_rejects_non_finite_values(memory_value):
+    def run(*args, **kwargs):
+        return SimpleNamespace(stdout=f"123\n{memory_value}\n")
+
+    assert benchmark.read_gpu_memory_used_mb(run=run) is None
+
+
+def test_read_gpu_memory_used_mb_returns_unavailable_when_query_fails():
+    def run(*args, **kwargs):
+        raise OSError("nvidia-smi unavailable")
+
+    assert benchmark.read_gpu_memory_used_mb(run=run) is None
+
+
+def test_max_observed_gpu_memory_mb_ignores_unavailable_samples():
+    assert benchmark.max_observed_gpu_memory_mb(
+        [None, 123.0, None, 456.0, 321.0]
+    ) == pytest.approx(456.0)
+
+
+def test_max_observed_gpu_memory_mb_returns_unavailable_when_all_samples_fail():
+    assert benchmark.max_observed_gpu_memory_mb([None, None]) is None
+
+
+@pytest.mark.parametrize(
+    (
+        "fused_gemm_value",
+        "m64_value",
+        "expected_enabled",
+        "expected_m64_opt_in",
+        "expected_limit",
+    ),
+    [
+        (None, None, True, False, 32),
+        ("0", None, False, False, 32),
+        ("1", None, True, False, 32),
+        (None, "0", True, False, 32),
+        (None, "1", True, True, 64),
+        ("0", "1", False, True, 32),
+        ("1", "0", True, False, 32),
+        ("1", "1", True, True, 64),
+        ("1", "yes", True, False, 32),
+    ],
+)
+def test_fused_configuration_status_reports_environment_truth_table(
+    fused_gemm_value,
+    m64_value,
+    expected_enabled,
+    expected_m64_opt_in,
+    expected_limit,
+):
+    environment = {}
+    if fused_gemm_value is not None:
+        environment["BONSAI_FUSED_GEMM"] = fused_gemm_value
+    if m64_value is not None:
+        environment["BONSAI_FUSED_GEMM_M64"] = m64_value
+
+    status = benchmark.fused_configuration_status(environment)
+
+    assert status["fused_gemm_enabled"] is expected_enabled
+    assert status["m64_fused_opt_in"] is expected_m64_opt_in
+    assert status["configured_fused_m_limit"] == expected_limit
+    assert status["fused_gemm_raw_value"] == (
+        fused_gemm_value if fused_gemm_value is not None else "<unset>"
     )
-
-    assert benchmark.peak_memory_allocated_mb(fake_torch_cuda) == pytest.approx(3.5)
-
-
-def test_peak_memory_allocated_mb_returns_unavailable_when_cuda_is_unusable():
-    assert hasattr(benchmark, "peak_memory_allocated_mb")
-    fake_torch_cuda = SimpleNamespace(is_available=lambda: False)
-
-    assert benchmark.peak_memory_allocated_mb(fake_torch_cuda) is None
-
-
-def test_peak_memory_allocated_mb_returns_unavailable_when_peak_query_fails():
-    assert hasattr(benchmark, "peak_memory_allocated_mb")
-
-    def max_memory_allocated():
-        raise RuntimeError("CUDA unavailable")
-
-    fake_torch_cuda = SimpleNamespace(
-        is_available=lambda: True,
-        max_memory_allocated=max_memory_allocated,
+    assert status["fused_gemm_status"] == (
+        "configured_eligible_only" if expected_enabled else "configured_disabled"
     )
-
-    assert benchmark.peak_memory_allocated_mb(fake_torch_cuda) is None
 
 
 def test_summarize_batch_stats_uses_actual_aggregate_tokens():
@@ -171,3 +224,22 @@ def test_measure_batches_aggregates_completion_tokens_excluding_warmup():
     assert token_counts == [4, 6]
     assert batch_seconds == [1.0, 2.0]
     assert last_outputs is measured_batches[-1]
+
+
+def test_measure_batches_samples_memory_after_each_measured_batch():
+    events = []
+
+    def generate():
+        events.append("generate")
+        return []
+
+    def sample_memory():
+        events.append("sample")
+
+    benchmark.measure_batches(
+        generate=generate,
+        repetitions=2,
+        sample_memory=sample_memory,
+    )
+
+    assert events == ["generate", "sample", "generate", "sample"]

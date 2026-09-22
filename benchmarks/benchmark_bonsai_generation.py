@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,22 +18,60 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-def peak_memory_allocated_mb(cuda: object) -> float | None:
+def read_gpu_memory_used_mb(
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> float | None:
     try:
-        if not getattr(cuda, "is_available")():
+        result = run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        values = [
+            float(line.strip()) for line in result.stdout.splitlines() if line.strip()
+        ]
+        if not values or not all(math.isfinite(value) for value in values):
             return None
-        return getattr(cuda, "max_memory_allocated")() / (1024 * 1024)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return max(values)
+    except (
+        AttributeError,
+        OSError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ):
         return None
 
 
-def read_gpu_peak_memory_mb() -> float | None:
-    try:
-        import torch
+def max_observed_gpu_memory_mb(
+    samples: Sequence[float | None],
+) -> float | None:
+    observed_samples = [sample for sample in samples if sample is not None]
+    return max(observed_samples, default=None)
 
-        return peak_memory_allocated_mb(torch.cuda)
-    except (AttributeError, ImportError, OSError, RuntimeError):
-        return None
+
+def fused_configuration_status(
+    environment: Mapping[str, str],
+) -> dict[str, bool | int | str]:
+    fused_gemm_raw_value = environment.get("BONSAI_FUSED_GEMM", "<unset>")
+    fused_gemm_enabled = environment.get("BONSAI_FUSED_GEMM") != "0"
+    m64_fused_opt_in = environment.get("BONSAI_FUSED_GEMM_M64") == "1"
+    return {
+        "fused_gemm_raw_value": fused_gemm_raw_value,
+        "fused_gemm_enabled": fused_gemm_enabled,
+        "m64_fused_opt_in": m64_fused_opt_in,
+        "configured_fused_m_limit": (
+            64 if fused_gemm_enabled and m64_fused_opt_in else 32
+        ),
+        "fused_gemm_status": (
+            "configured_eligible_only" if fused_gemm_enabled else "configured_disabled"
+        ),
+    }
 
 
 def positive_int(value: str) -> int:
@@ -68,6 +108,7 @@ def measure_batches(
     generate: Callable[[], Sequence[object]],
     repetitions: int,
     clock: Callable[[], float] = time.perf_counter,
+    sample_memory: Callable[[], None] | None = None,
 ) -> tuple[list[int], list[float], Sequence[object]]:
     if repetitions <= 0:
         raise ValueError("repetitions must be positive")
@@ -80,6 +121,8 @@ def measure_batches(
         measured_outputs = generate()
         batch_seconds.append(clock() - generation_start)
         generated_token_counts.append(count_generated_tokens(measured_outputs))
+        if sample_memory is not None:
+            sample_memory()
     return generated_token_counts, batch_seconds, measured_outputs
 
 
@@ -167,6 +210,7 @@ def main() -> None:
         os.environ["BONSAI_FUSED_GEMM"] = "0"
     else:
         os.environ.pop("BONSAI_FUSED_GEMM", None)
+    fused_status = fused_configuration_status(os.environ)
 
     from vllm import LLM, SamplingParams
 
@@ -191,11 +235,13 @@ def main() -> None:
     llm.generate(prompts, sampling_params)
     warmup_seconds = time.perf_counter() - warmup_start
 
+    gpu_memory_samples = [read_gpu_memory_used_mb()]
     generated_token_counts, batch_seconds, measured_outputs = measure_batches(
         generate=lambda: llm.generate(prompts, sampling_params),
         repetitions=args.repetitions,
+        sample_memory=lambda: gpu_memory_samples.append(read_gpu_memory_used_mb()),
     )
-    gpu_peak_memory_mb = read_gpu_peak_memory_mb()
+    gpu_memory_used_mb = max_observed_gpu_memory_mb(gpu_memory_samples)
 
     summary = summarize_batch_stats(
         generated_token_counts=generated_token_counts,
@@ -217,12 +263,17 @@ def main() -> None:
     p50_batch_seconds = summary["p50_batch_seconds"]
     p95_batch_seconds = summary["p95_batch_seconds"]
     gpu_memory_report = (
-        str(gpu_peak_memory_mb) if gpu_peak_memory_mb is not None else "unavailable"
+        str(gpu_memory_used_mb) if gpu_memory_used_mb is not None else "unavailable"
     )
     total_seconds = time.perf_counter() - total_start
 
     print(f"mode={args.mode}")
     print(f"enforce_eager={args.enforce_eager}")
+    print(f"BONSAI_FUSED_GEMM={fused_status['fused_gemm_raw_value']}")
+    print(f"fused_gemm_enabled={fused_status['fused_gemm_enabled']}")
+    print(f"m64_fused_opt_in={fused_status['m64_fused_opt_in']}")
+    print(f"configured_fused_m_limit={fused_status['configured_fused_m_limit']}")
+    print(f"fused_gemm_status={fused_status['fused_gemm_status']}")
     print(f"batch_size={args.batch_size}")
     print(f"repetitions={args.repetitions}")
     print(f"prompt_tokens={prompt_tokens}")
@@ -240,6 +291,7 @@ def main() -> None:
     print(f"generated_tokens_per_second={generated_tokens_per_second:.6f}")
     print(f"p50_batch_seconds={p50_batch_seconds:.6f}")
     print(f"p95_batch_seconds={p95_batch_seconds:.6f}")
+    print("gpu_memory_source=nvidia-smi_observed_max")
     print(f"gpu_memory_used_mb={gpu_memory_report}")
     print(f"load_seconds={load_seconds:.6f}")
     print(f"warmup_seconds={warmup_seconds:.6f}")

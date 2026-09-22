@@ -10,7 +10,7 @@ DEEPGEMM_GIT_REPO="https://github.com/vllm-project/DeepGEMM.git"
 # NOTE: This targets the vLLM fork's dev branch tip, which carries the sm120
 # and sm90 paged-MQA ports plus the SwiGLU alpha/beta and SiTU Mega MoE
 # activations
-DEEPGEMM_GIT_REF="a6bbb8000161c0dc3a85a0300a905f76898a7913"
+DEEPGEMM_GIT_REF="e1f418c2a4f20818221f6b0e578b4c2f634d4c3f"
 WHEEL_DIR=""
 
 # Parse command line arguments
@@ -74,8 +74,8 @@ CUDA_MINOR="${CUDA_MINOR%%.*}"
 echo "CUDA version: $CUDA_VERSION (major: $CUDA_MAJOR, minor: $CUDA_MINOR)"
 
 # Check CUDA version requirement
-if [ "$CUDA_MAJOR" -lt 12 ] || { [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -lt 8 ]; }; then
-    echo "Skipping DeepGEMM build/installation (requires CUDA 12.8+ but got ${CUDA_VERSION})"
+if [ "$CUDA_MAJOR" -lt 12 ] || { [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -lt 9 ]; }; then
+    echo "Skipping DeepGEMM build/installation (requires CUDA 12.9+ but got ${CUDA_VERSION})"
     exit 0
 fi
 

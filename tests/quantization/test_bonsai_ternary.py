@@ -1,3 +1,4 @@
+import struct
 import numpy as np
 import torch
 import pytest
@@ -67,6 +68,107 @@ def test_gguf_reader_metadata_and_dir():
     assert by["blk.0.attn_qkv.weight"].dims == (5120, 10240)
     assert by["blk.0.ssm_out.weight"].dims == (6144, 5120)
     assert by["output_norm.weight"].ggml_type == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_count", "metadata_kv_count"),
+    [(1 << 32, 0), (0, 1 << 32)],
+    ids=("tensor-count", "metadata-count"),
+)
+def test_gguf_reader_does_not_truncate_wide_header_counts(
+    tmp_path, tensor_count, metadata_kv_count
+):
+    path = tmp_path / "wide-count.gguf"
+    path.write_bytes(
+        b"GGUF" + struct.pack("<IQQ", 3, tensor_count, metadata_kv_count)
+    )
+
+    from gguf_reader_min import GgufMinReader
+
+    with pytest.raises(AssertionError, match="short read"):
+        GgufMinReader(path)
+
+
+def test_gguf_reader_defaults_alignment_to_32(tmp_path):
+    path = tmp_path / "default-alignment.gguf"
+    path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"\x00" * 8)
+
+    from gguf_reader_min import GgufMinReader
+
+    reader = GgufMinReader(path)
+    assert reader._data_start == 32
+
+
+@pytest.mark.parametrize("alignment", (24, 64, 8192))
+def test_gguf_reader_uses_general_alignment_for_tensor_data(
+    tmp_path, alignment
+):
+    path = tmp_path / f"alignment-{alignment}.gguf"
+    key = b"general.alignment"
+    name = b"marker"
+    marker = struct.pack("<f", 123.5)
+    prefix = (
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 1, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<II", 4, alignment)
+        + struct.pack("<Q", len(name))
+        + name
+        + struct.pack("<I", 1)
+        + struct.pack("<Q", 1)
+        + struct.pack("<IQ", 0, alignment)
+    )
+    data_start = (len(prefix) + alignment - 1) // alignment * alignment
+    path.write_bytes(
+        prefix
+        + b"\x00" * (data_start - len(prefix))
+        + b"\x00" * alignment
+        + marker
+    )
+
+    from gguf_reader_min import GgufMinReader
+
+    reader = GgufMinReader(path)
+    assert reader.get_i32("general.alignment") == alignment
+    assert reader._data_start == data_start
+    assert reader.tensors[0].offset == alignment
+    assert reader.tensor_data(reader.tensors[0]) == marker
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value_fmt", "alignment"),
+    [
+        (4, "<I", 0),
+        (4, "<I", 4),
+        (4, "<I", 10),
+        (10, "<Q", 1 << 32),
+    ],
+    ids=(
+        "zero",
+        "power-of-two-not-multiple-of-8",
+        "non-multiple-of-8",
+        "out-of-uint32",
+    ),
+)
+def test_gguf_reader_rejects_invalid_alignment(
+    tmp_path, value_type, value_fmt, alignment
+):
+    path = tmp_path / "invalid-alignment.gguf"
+    key = b"general.alignment"
+    path.write_bytes(
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", value_type)
+        + struct.pack(value_fmt, alignment)
+    )
+
+    from gguf_reader_min import GgufMinReader
+
+    with pytest.raises(ValueError, match="invalid GGUF alignment"):
+        GgufMinReader(path)
 
 
 def test_q2b1_pack_roundtrip():
@@ -251,6 +353,239 @@ def test_converter_keeps_qwen35_gdn_projection_tensors_separate(monkeypatch, tmp
     converter.main()
 
     assert set(saved) == {qkv, qkv + "_scale", z, z + "_scale"}
+
+
+def _tokenizer_reader(tokens):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(get_strs=lambda _key: tokens)
+
+
+def _install_fake_tokenizer(monkeypatch, tokenizer):
+    from types import ModuleType, SimpleNamespace
+
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(
+        from_pretrained=lambda *_args, **_kwargs: tokenizer
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+
+def _make_fake_tokenizer(
+    tokens, save_pretrained, *, vocab_size=None, replacements=None
+):
+    replacements = replacements or {}
+
+    class FakeTokenizer:
+        def __len__(self):
+            return len(tokens) if vocab_size is None else vocab_size
+
+        def convert_ids_to_tokens(self, token_id):
+            return replacements.get(token_id, tokens[token_id])
+
+        def save_pretrained(self, out_dir):
+            save_pretrained(out_dir)
+
+    return FakeTokenizer()
+
+
+def _write_tokenizer_artifacts(out_dir, names):
+    for name in names:
+        with open(os.path.join(out_dir, name), "w") as f:
+            f.write("{}")
+
+
+@pytest.mark.parametrize("failure", ("import", "load"))
+def test_export_tokenizer_raises_on_import_or_load_failure(
+    monkeypatch, tmp_path, failure
+):
+    import types
+
+    from prism_bonsai_convert import export_tokenizer
+
+    transformers = types.ModuleType("transformers")
+    if failure == "load":
+        load_failure = OSError("tokenizer load failed")
+
+        def fail_load(*_args, **_kwargs):
+            raise load_failure
+
+        transformers.AutoTokenizer = types.SimpleNamespace(
+            from_pretrained=fail_load
+        )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    with pytest.raises(RuntimeError, match="tokenizer"):
+        export_tokenizer(_tokenizer_reader([]), str(tmp_path))
+
+
+@pytest.mark.parametrize("mismatch", ("vocabulary", "spot-check"))
+def test_export_tokenizer_raises_on_tokenizer_mismatch(
+    monkeypatch, tmp_path, mismatch
+):
+    from prism_bonsai_convert import export_tokenizer
+
+    tokens = [f"token-{i}" for i in range(248047)]
+
+    save_calls = []
+
+    def record_save(out_dir):
+        save_calls.append(out_dir)
+
+    tokenizer = _make_fake_tokenizer(
+        tokens,
+        record_save,
+        vocab_size=len(tokens) + (mismatch == "vocabulary"),
+        replacements={42: "wrong-token"} if mismatch == "spot-check" else None,
+    )
+    _install_fake_tokenizer(monkeypatch, tokenizer)
+
+    with pytest.raises(RuntimeError, match="tokenizer"):
+        export_tokenizer(_tokenizer_reader(tokens), str(tmp_path))
+    assert save_calls == []
+
+
+def test_export_tokenizer_raises_on_save_failure(monkeypatch, tmp_path):
+    from prism_bonsai_convert import export_tokenizer
+
+    tokens = [f"token-{i}" for i in range(248047)]
+    save_failure = OSError("tokenizer write failed")
+
+    def fail_save(_out_dir):
+        raise save_failure
+
+    tokenizer = _make_fake_tokenizer(tokens, fail_save)
+    _install_fake_tokenizer(monkeypatch, tokenizer)
+
+    with pytest.raises(RuntimeError, match="tokenizer") as exc_info:
+        export_tokenizer(_tokenizer_reader(tokens), str(tmp_path))
+    assert exc_info.value.__cause__ is save_failure
+
+
+def test_export_tokenizer_raises_when_saved_artifacts_are_missing(
+    monkeypatch, tmp_path
+):
+    from prism_bonsai_convert import export_tokenizer
+
+    tokens = [f"token-{i}" for i in range(248047)]
+
+    def write_partial_tokenizer(out_dir):
+        _write_tokenizer_artifacts(out_dir, ("tokenizer.json",))
+
+    tokenizer = _make_fake_tokenizer(tokens, write_partial_tokenizer)
+    _install_fake_tokenizer(monkeypatch, tokenizer)
+
+    with pytest.raises(RuntimeError, match="tokenizer"):
+        export_tokenizer(_tokenizer_reader(tokens), str(tmp_path))
+
+
+def test_export_tokenizer_success_requires_expected_artifacts(
+    monkeypatch, tmp_path, capsys
+):
+    from prism_bonsai_convert import export_tokenizer
+
+    tokens = [f"token-{i}" for i in range(248047)]
+
+    def write_expected_tokenizer(out_dir):
+        _write_tokenizer_artifacts(
+            out_dir, ("tokenizer.json", "tokenizer_config.json")
+        )
+
+    tokenizer = _make_fake_tokenizer(tokens, write_expected_tokenizer)
+    _install_fake_tokenizer(monkeypatch, tokenizer)
+
+    export_tokenizer(_tokenizer_reader(tokens), str(tmp_path))
+
+    assert (tmp_path / "tokenizer.json").is_file()
+    assert (tmp_path / "tokenizer_config.json").is_file()
+    assert any(
+        line.startswith("[tokenizer] verified ")
+        for line in capsys.readouterr().out.splitlines()
+    )
+
+
+@pytest.mark.parametrize("failure", ("load", "mismatch", "save", "artifacts"))
+def test_export_tokenizer_main_does_not_report_success_on_failure(
+    monkeypatch, tmp_path, capsys, failure
+):
+    import types
+    from types import SimpleNamespace
+
+    import prism_bonsai_convert as converter
+
+    tokens = [f"token-{i}" for i in range(248047)]
+    save_calls = []
+    if failure == "load":
+        transformers = types.ModuleType("transformers")
+        load_failure = OSError("tokenizer load failed")
+
+        def fail_load(*_args, **_kwargs):
+            raise load_failure
+
+        transformers.AutoTokenizer = types.SimpleNamespace(
+            from_pretrained=fail_load
+        )
+        monkeypatch.setitem(sys.modules, "transformers", transformers)
+    else:
+        if failure == "mismatch":
+            def save_tokenizer(out_dir):
+                save_calls.append(out_dir)
+
+            tokenizer = _make_fake_tokenizer(
+                tokens, save_tokenizer, vocab_size=len(tokens) + 1
+            )
+        elif failure == "save":
+            save_failure = OSError("tokenizer write failed")
+
+            def fail_save(_out_dir):
+                raise save_failure
+
+            tokenizer = _make_fake_tokenizer(tokens, fail_save)
+        else:
+            def write_partial_tokenizer(out_dir):
+                _write_tokenizer_artifacts(out_dir, ("tokenizer.json",))
+
+            tokenizer = _make_fake_tokenizer(tokens, write_partial_tokenizer)
+        _install_fake_tokenizer(monkeypatch, tokenizer)
+
+    reader = SimpleNamespace(
+        tensors=[SimpleNamespace(name="tensor")],
+        get_strs=lambda _key: tokens,
+    )
+    monkeypatch.setattr(converter, "GgufMinReader", lambda _path: reader)
+    monkeypatch.setattr(
+        converter, "build_name_map", lambda _reader: {"tensor": "model.tensor"}
+    )
+
+    def fake_convert(_reader, _info, hf_name, output):
+        output[hf_name] = torch.zeros(1)
+
+    monkeypatch.setattr(converter, "convert_tensor", fake_convert)
+    monkeypatch.setattr(
+        converter,
+        "build_config",
+        lambda _reader: {"quantization_config": {"hadamard_folded": []}},
+    )
+
+    def fake_save_file(_tensors, path, metadata):
+        with open(path, "wb") as f:
+            f.write(b"model")
+
+    monkeypatch.setattr("safetensors.torch.save_file", fake_save_file)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prism_bonsai_convert.py", "input.gguf", "--out", str(tmp_path)],
+    )
+
+    with pytest.raises(RuntimeError, match="tokenizer"):
+        converter.main()
+
+    output = capsys.readouterr().out
+    assert "[done]" not in output
+    assert "[tokenizer] verified" not in output
+    if failure == "mismatch":
+        assert save_calls == []
 
 
 def test_vllm_weight_metadata_tracks_input_packing():

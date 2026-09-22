@@ -348,14 +348,12 @@ GENERATION_CONFIG = {
 def export_tokenizer(reader, out_dir):
     try:
         from transformers import AutoTokenizer
-    except Exception as e:  # pragma: no cover - environment dependent
-        print(f"[tokenizer] CONCERN: transformers unavailable ({e}); no tokenizer files written")
-        return
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("tokenizer export failed: transformers is unavailable") from exc
     try:
         tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B")
-    except Exception as e:  # pragma: no cover - network dependent
-        print(f"[tokenizer] CONCERN: could not load Qwen/Qwen3.8-27B tokenizer ({e}); no tokenizer files written")
-        return
+    except Exception as exc:  # pragma: no cover - network dependent
+        raise RuntimeError("tokenizer export failed: could not load Qwen/Qwen3.8-27B") from exc
     ggml_tokens = reader.get_strs("tokenizer.ggml.tokens")
     spot_ids = [0, 1, 42, 248044, 248046]
     spot_ok = all(tok.convert_ids_to_tokens(i) == ggml_tokens[i] for i in spot_ids)
@@ -371,17 +369,41 @@ def export_tokenizer(reader, out_dir):
             setattr(tok, attr, ggml_tokens[token_id])
 
     spot_ok = all(tok.convert_ids_to_tokens(i) == ggml_tokens[i] for i in spot_ids)
-    if len(tok) == len(ggml_tokens) and spot_ok:
+    if len(tok) != len(ggml_tokens) or not spot_ok:
+        raise RuntimeError(
+            f"tokenizer export failed: vocabulary mismatch "
+            f"len(tok)={len(tok)} vs ggml={len(ggml_tokens)}, "
+            f"spot-check ids {spot_ids} ok={spot_ok}"
+        )
+
+    try:
         tok.save_pretrained(out_dir)
-        print(
-            f"[tokenizer] verified (len={len(tok)}, added={added}, "
-            f"spot-check ok) and saved to {out_dir}"
+    except Exception as exc:
+        raise RuntimeError(
+            f"tokenizer export failed: could not save tokenizer to {out_dir}"
+        ) from exc
+
+    required_artifacts = ("tokenizer.json", "tokenizer_config.json")
+    try:
+        missing_artifacts = [
+            name
+            for name in required_artifacts
+            if not os.path.isfile(os.path.join(out_dir, name))
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            f"tokenizer export failed: could not verify saved artifacts in {out_dir}"
+        ) from exc
+    if missing_artifacts:
+        raise RuntimeError(
+            f"tokenizer export failed: missing required artifacts in {out_dir}: "
+            f"{', '.join(missing_artifacts)}"
         )
-    else:
-        print(
-            f"[tokenizer] CONCERN: vocab mismatch len(tok)={len(tok)} vs ggml={len(ggml_tokens)}, "
-            f"spot-check ids {spot_ids} ok={spot_ok}; tokenizer NOT written"
-        )
+
+    print(
+        f"[tokenizer] verified (len={len(tok)}, added={added}, "
+        f"spot-check ok) and saved to {out_dir}"
+    )
 
 
 def main():

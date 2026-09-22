@@ -1,3 +1,12 @@
+# CUDA 12.8 must build without DeepGEMM's _C target. QuTLASS remains the
+# supported path for CUDA 12.8 Blackwell builds.
+if("${CMAKE_CUDA_COMPILER_VERSION}" VERSION_LESS "12.9")
+  message(STATUS
+    "DeepGEMM disabled: CUDA ${CMAKE_CUDA_COMPILER_VERSION} is older than 12.9")
+  add_custom_target(_deep_gemm_C)
+  return()
+endif()
+
 include(FetchContent)
 
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
@@ -32,7 +41,7 @@ else()
   # Pinned to the tip of the fork's dev branch: upstream 2.8.0 plus the SM120
   # port, the SM90 paged-MQA kv_block=32/next_n=4 port, configurable SwiGLU
   # alpha/beta, and SiTU for FP8/FP4 Mega MoE.
-  set(_DEEPGEMM_UPSTREAM_TAG "a6bbb8000161c0dc3a85a0300a905f76898a7913")
+  set(_DEEPGEMM_UPSTREAM_TAG "e1f418c2a4f20818221f6b0e578b4c2f634d4c3f")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
@@ -60,27 +69,14 @@ else()
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 endif()
 
-# DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100 (official upstream),
-# and 12.8+ for SM120 / SM12x. CUDA 13+ can use the family-specific SM12x
-# arch; CUDA 12.x builds the arch-specific SM120/SM121 variants.
-set(DEEPGEMM_SUPPORT_ARCHS)
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
-  list(APPEND DEEPGEMM_SUPPORT_ARCHS "9.0a")
+# DeepGEMM requires CUDA 12.9+ for SM90/SM100. SM120 uses the family-specific
+# architecture introduced in CUDA 13.0 and must not be selected earlier.
+set(DEEPGEMM_SUPPORT_ARCHS "9.0a" "10.0f")
+if("${CMAKE_CUDA_COMPILER_VERSION}" VERSION_GREATER_EQUAL "13.0")
+  list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0f")
 endif()
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-    list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0f")
-    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4)
-      list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.7f")
-    endif()
-  else()
-    list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
-  endif()
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0f")
-  else()
-    list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0a" "12.1a")
-  endif()
+if("${CMAKE_CUDA_COMPILER_VERSION}" VERSION_GREATER_EQUAL "13.4")
+  list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.7f")
 endif()
 
 cuda_archs_loose_intersection(DEEPGEMM_ARCHS
