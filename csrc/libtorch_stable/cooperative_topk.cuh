@@ -86,7 +86,8 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* a, uint32_t p) {
   uint32_t done = 0;
   do {
     asm volatile(
-        "{.reg .pred p; mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; selp.b32 %0, 1, 0, p;}"
+        "{.reg .pred p; mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 "
+        "p, [%1], %2; selp.b32 %0, 1, 0, p;}"
         : "=r"(done)
         : "r"(addr), "r"(p)
         : "memory");
@@ -103,7 +104,8 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* a,
 __device__ __forceinline__ void tma_load(void* d, const void* s, uint32_t n,
                                          uint64_t* m) {
   asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(smem_u32(d)),
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], "
+      "[%1], %2, [%3];" ::"r"(smem_u32(d)),
       "l"(s), "r"(n), "r"(smem_u32(m))
       : "memory");
 }

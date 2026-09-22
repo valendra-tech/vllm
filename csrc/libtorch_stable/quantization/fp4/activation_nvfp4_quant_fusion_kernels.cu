@@ -102,8 +102,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       if (valid) {
         if constexpr (CVT_FP4_PACK16) {
           int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              packed_to_u64(out_val);
+          uint64_t packed64 = packed_to_u64(out_val);
           reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
         } else {
           int64_t outOffset =

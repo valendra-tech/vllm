@@ -107,8 +107,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
         if (valid_output) {
           if constexpr (CVT_FP4_PACK16) {
             int64_t outOffset = rowIdx * (outputCols / 8) + colIdx * 2;
-            uint64_t packed64 =
-                packed_to_u64(out_val);
+            uint64_t packed64 = packed_to_u64(out_val);
             reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
           } else {
             int64_t outOffset =
@@ -121,8 +120,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
         // the padded-output predicate and use the original address arithmetic.
         if constexpr (CVT_FP4_PACK16) {
           int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              packed_to_u64(out_val);
+          uint64_t packed64 = packed_to_u64(out_val);
           reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
         } else {
           reinterpret_cast<fp4_packed_t*>(out)[inOffset] = out_val;
@@ -191,8 +189,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       if (rowIdx < numRows) {
         if constexpr (CVT_FP4_PACK16) {
           int64_t outOffset = rowIdx * (outputCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              packed_to_u64(out_val);
+          uint64_t packed64 = packed_to_u64(out_val);
           reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
         } else {
           int64_t outOffset =
