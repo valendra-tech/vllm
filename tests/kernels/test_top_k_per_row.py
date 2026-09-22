@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import re
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -1166,6 +1169,44 @@ def run_large_context_topk_test(
         ), f"""Row {i}: Top-k values don't match.
             CUDA: {cuda_vals.sort(descending=True)[0][:10]},
             Torch: {torch_vals.sort(descending=True)[0][:10]}"""
+
+
+def test_cooperative_topk_barrier_contracts() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/libtorch_stable/cooperative_topk.cuh"
+    ).read_text(encoding="utf-8")
+
+    wrapper_bodies = {}
+    for name in (
+        "mbarrier_init",
+        "mbarrier_wait",
+        "mbarrier_arrive_expect_tx",
+    ):
+        wrapper = re.search(
+            rf"void {name}\b.*?\{{(?P<body>.*?)^\}}",
+            source,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        assert wrapper is not None, f"missing {name} wrapper"
+        body = wrapper.group("body")
+        assert ': "memory"' in body, (
+            f"{name} wrapper must include a memory clobber"
+        )
+        wrapper_bodies[name] = body
+
+    assert ".acquire." in wrapper_bodies["mbarrier_wait"]
+    assert ".release." in wrapper_bodies["mbarrier_arrive_expect_tx"]
+
+    call_sites = re.findall(
+        r"^[ \t]*(mbarrier_arrive_expect_tx|tma_load)[ \t]*\(",
+        source,
+        flags=re.MULTILINE,
+    )
+    assert call_sites == ["mbarrier_arrive_expect_tx", "tma_load"] * 3, (
+        "expected three arrive-before-load call-site pairs, "
+        f"got {call_sites!r}"
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

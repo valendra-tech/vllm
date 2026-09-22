@@ -76,24 +76,29 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 __device__ __forceinline__ void mbarrier_init(uint64_t* a, uint32_t n) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(a)),
-               "r"(n));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+               :
+               : "r"(smem_u32(a)), "r"(n)
+               : "memory");
 }
 __device__ __forceinline__ void mbarrier_wait(uint64_t* a, uint32_t p) {
   uint32_t addr = smem_u32(a);
   uint32_t done = 0;
   do {
     asm volatile(
-        "{.reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.b32 %0, 1, 0, p;}"
+        "{.reg .pred p; mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; selp.b32 %0, 1, 0, p;}"
         : "=r"(done)
-        : "r"(addr), "r"(p));
+        : "r"(addr), "r"(p)
+        : "memory");
   } while (!done);
 }
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* a,
                                                           uint32_t t) {
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
-                   smem_u32(a)),
-               "r"(t));
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+      :
+      : "r"(smem_u32(a)), "r"(t)
+      : "memory");
 }
 __device__ __forceinline__ void tma_load(void* d, const void* s, uint32_t n,
                                          uint64_t* m) {
@@ -180,9 +185,9 @@ __device__ void tma_stream_pass(const float* scores, uint32_t length,
       }
       const auto o = i * kSizePerStage;
       const auto sz = min(kSizePerStage, la - o) * sizeof(float);
+      mbarrier_arrive_expect_tx(&smem->barrier[pass][i], sz);
       tma_load(smem->score_buffer[i], scores + o, sz,
                &smem->barrier[pass][i]);  // cp.async.bulk is non-blocking
-      mbarrier_arrive_expect_tx(&smem->barrier[pass][i], sz);
     }
   }
 
@@ -230,9 +235,9 @@ __device__ void tma_stream_pass(const float* scores, uint32_t length,
     if (tx == 0 && it + kStages < ni) {
       const auto no = (it + kStages) * kSizePerStage;
       const auto nsz = min(kSizePerStage, la - no) * sizeof(float);
+      mbarrier_arrive_expect_tx(&smem->barrier[pass][b], nsz);
       tma_load(smem->score_buffer[b], scores + no, nsz,
                &smem->barrier[pass][b]);
-      mbarrier_arrive_expect_tx(&smem->barrier[pass][b], nsz);
     }
   }
 }
@@ -306,10 +311,10 @@ __device__ void large_topk(const float* __restrict__ row_input,
       for (uint32_t i = 0; i < num_iters; i++) {
         const auto off = i * kSizePerStage;
         const auto sz = min(kSizePerStage, len_aligned - off) * sizeof(float);
+        mbarrier_arrive_expect_tx(&smem->barrier[0][i], sz);
         tma_load(smem->score_buffer[i], row_input + my_start + off, sz,
                  &smem->barrier[0][i]);  // cp.async.bulk of size kSizePerStage
                                          // × sizeof(float)
-        mbarrier_arrive_expect_tx(&smem->barrier[0][i], sz);
       }
     }
     __syncthreads();
