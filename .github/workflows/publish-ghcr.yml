@@ -15,8 +15,10 @@ permissions:
 
 jobs:
   build-and-publish:
-    name: Publish ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    name: Build and push image
+    runs-on:
+      - self-hosted
+      - linux
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -38,21 +40,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Free runner disk space
-        shell: bash
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android/sdk /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          sudo docker system prune --all --force
-          df -h /
-
-          available_kib=$(df -Pk / | awk 'NR == 2 { print $4 }')
-          minimum_kib=$((20 * 1024 * 1024))
-          if (( available_kib < minimum_kib )); then
-            echo "::error::Only ${available_kib} KiB available after cleanup; at least ${minimum_kib} KiB is required."
-            exit 1
-          fi
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
