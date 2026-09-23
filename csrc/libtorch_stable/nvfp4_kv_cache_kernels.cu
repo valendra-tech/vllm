@@ -268,7 +268,7 @@ __global__ void reshape_and_cache_nvfp4_kernel(
         // 16 elements → 8 bytes (u32x2)
         int data_byte_offset = group_in_head * 8;
         reinterpret_cast<uint64_t*>(data_dst + data_byte_offset)[0] =
-            (uint64_t(packed.hi) << 32) | uint64_t(packed.lo);
+            packed_to_u64(packed);
       }
 #else
       {

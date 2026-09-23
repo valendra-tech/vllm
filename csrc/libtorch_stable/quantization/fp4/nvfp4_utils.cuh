@@ -115,6 +115,16 @@ struct u32x2 {
 
 using fp4_packed_t = std::conditional_t<CVT_FP4_PACK16, u32x2, uint32_t>;
 
+// CUDA < 12.9 scalar fallback: allow the PACK16 branch to be parsed even
+// when fp4_packed_t resolves to uint32_t (nvcc EDG checks non-dependent
+// discarded statements).
+__device__ __forceinline__ uint64_t packed_to_u64(uint32_t v) {
+  return uint64_t(v);
+}
+__device__ __forceinline__ uint64_t packed_to_u64(u32x2 v) {
+  return (uint64_t(v.hi) << 32) | uint64_t(v.lo);
+}
+
 __device__ __forceinline__ u32x2 fp32_vec16_to_e2m1(float2 (&array)[8]) {
   u32x2 out;
   asm volatile(

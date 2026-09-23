@@ -1,0 +1,582 @@
+"""Bonsai ternary (Q2b1) Linear method with fp8 / int4 / int8 targets.
+
+Task 7 first-pass correctness implementation.  Weights arrive as the packed
+safetensors layout (Q2b1 uint8 + per-(out, group) fp16 scales):
+
+- ``packed``: uint8 (N, K//4).  Per output row, per 128-input group: 32
+  bytes, weight j (within group) -> byte j//4, bits (j%4)*2 LSB-first;
+  code 00->0, 01->+1, 10->-1, 11->0.
+- ``scale``: fp16 (N, K//128), one scale per (output row, input group).
+
+After loading we decode trits with the CUDA LUT kernel and keep resident
+weights per target:
+
+- "fp8":  (N, K) float8_e4m3fn with fp32 per-128-group amax scales.  apply()
+  dequantizes to bf16 once (cached) and uses plain torch.matmul.  A
+  grouped-scale fp8 GEMM integration lands in Task 9; this path exists to
+  lock down numerics.
+- "int4"/"int8": exact int8 trits + fp32 grouped scales, dequantized to
+  bf16 for a W4A16-style dequant matmul.  Marlin int4 packing lands in
+  Task 9.
+- "nvfp4": NotImplementedError for now.
+
+Hadamard rotation: y = (x*signs @ H^T) @ W^T where H is the normalized
+1024-block WHT and signs is a per-input-position (+/-1) vector.  For K > 1024
+the signs+FWHT is applied per 1024-block (each block of x uses its own slice
+of signs), matching the block-diagonal rotation of the checkpoint format.
+"""
+
+import os
+from contextlib import suppress
+
+import torch
+
+from .bonsai_decode import (
+    BonsaiQ2b1UnavailableError,
+    _decode_trits_fallback,
+    _is_current_stream_capturing,
+    _load_ext,
+    _make_lut,
+    decode_trits,
+    prewarm_q2b1_autotune,
+    q2b1_gemm_autotuned,
+)
+from .hadamard_fwht import fwht_signs, fwht_signs_quant_fp8
+
+_HADAMARD_BLOCK = 1024
+_SCALE_GROUP = 128
+
+
+class BonsaiTernaryConfig:
+    """Target selection for ternary Linear layers."""
+
+    def __init__(self, ternary_target: str = "auto"):
+        self.ternary_target = ternary_target
+
+    def resolve(self) -> str:
+        if self.ternary_target != "auto":
+            return self.ternary_target
+        if torch.cuda.get_device_capability()[0] >= 12:
+            return "nvfp4"
+        return "int4"
+
+
+class BonsaiTernaryLinearMethod:
+    """Hadamard-rotated ternary Linear: y = (x*signs @ H^T) @ W^T."""
+
+    def __init__(
+        self, config: BonsaiTernaryConfig, in_features: int, out_features: int
+    ):
+        self.config = config
+        self.in_features = in_features
+        self.out_features = out_features
+        self._target: str | None = None
+        self.signs: torch.Tensor | None = None
+        self.w_dq_bf16: torch.Tensor | None = None
+        self.w_target: torch.Tensor | None = None
+        self.w_scales: torch.Tensor | None = None
+        self._n_weight_bytes = 0
+
+    @property
+    def target(self) -> str:
+        assert self._target is not None, (
+            "process_weights_after_loading has not been called"
+        )
+        return self._target
+
+    def weight_bytes(self) -> int:
+        """Resident weight tensor bytes (for memory reporting)."""
+        return self._n_weight_bytes
+
+    def process_weights_after_loading(
+        self,
+        weights: dict[str, torch.Tensor],
+        signs: torch.Tensor,
+        device,
+    ) -> None:
+        target = self.config.resolve()
+        if target == "nvfp4":
+            raise NotImplementedError("nvfp4 ternary target lands in a later task")
+        K, N = self.in_features, self.out_features
+        assert K % _HADAMARD_BLOCK == 0, (
+            "in_features must be a multiple of the 1024 Hadamard block"
+        )
+        assert K % _SCALE_GROUP == 0, "in_features must be divisible by 128"
+
+        packed = weights["packed"].to(device)
+        scale = weights["scale"].to(device)
+        assert packed.shape == (N, K // 4) and packed.dtype == torch.uint8, (
+            f"packed weights must be uint8 (N, K//4), got {packed.shape} {packed.dtype}"
+        )
+        assert scale.shape == (N, K // 128) and scale.dtype == torch.float16, (
+            f"scales must be fp16 (N, K//128), got {scale.shape} {scale.dtype}"
+        )
+
+        # decode_trits consumes flat uint8 bytes -> (n, 4) int8 trits
+        # (LSB-first, 4 slots per byte); reshape back to (N, K//4, 4) then
+        # (N, K) to undo the packing.
+        trits = decode_trits(packed.reshape(-1)).reshape(N, K // 4, 4).reshape(N, K)
+
+        self.signs = signs.to(device=device, dtype=torch.float32).flatten()
+        assert self.signs.shape == (K,)
+
+        if target == "fp8":
+            w_f = trits.float() * scale.float().repeat_interleave(_SCALE_GROUP, dim=-1)
+            groups = w_f.reshape(N, K // _SCALE_GROUP, _SCALE_GROUP)
+            amax = groups.abs().amax(dim=-1).clamp(min=1e-12)
+            w_target = (
+                (groups / amax.unsqueeze(-1)).reshape(N, K).to(torch.float8_e4m3fn)
+            )
+            self.w_target = w_target
+            self.w_scales = amax  # fp32 (N, K//128)
+            # First-pass correctness implementation: cache the dequantized
+            # bf16 weights so apply() can use a plain matmul.  A
+            # grouped-scale fp8 GEMM (no bf16 dequant resident) is Task 9.
+            self.w_dq_bf16 = (
+                (
+                    w_target.float().view(N, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * amax.unsqueeze(-1)
+                )
+                .view(N, K)
+                .to(torch.bfloat16)
+            )
+            self._n_weight_bytes = (
+                w_target.numel() * w_target.element_size()
+                + amax.numel() * amax.element_size()
+            )
+        else:
+            # int4/int8: exact int8 trits + fp32 grouped scales.  Marlin
+            # int4 packing lands in Task 9; the int4 target currently uses
+            # the exact trits with a W4A16-style dequant matmul.
+            self.w_target = trits.to(torch.int8)
+            self.w_scales = scale.float()  # fp32 (N, K//128)
+            self.w_dq_bf16 = (
+                (
+                    self.w_target.float().view(N, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * self.w_scales.unsqueeze(-1)
+                )
+                .view(N, K)
+                .to(torch.bfloat16)
+            )
+            self._n_weight_bytes = (
+                self.w_target.numel() * self.w_target.element_size()
+                + self.w_scales.numel() * self.w_scales.element_size()
+            )
+        self._target = target
+
+    def _hadamard_blocks(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """x: (M, K) fp32 -> per-1024-block H @ (signs * x_b), concatenated.
+
+        Each block b uses its own signs slice, matching the block-diagonal
+        Hadamard rotation of the checkpoint format.  Returns (M, K) fp32.
+        """
+        nb = self.in_features // _HADAMARD_BLOCK
+        outs = [
+            fwht_signs(
+                x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK],
+                self.signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK],
+            )
+            for b in range(nb)
+        ]
+        return outs if nb > 1 else [outs[0]]
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        assert self._target is not None, (
+            "process_weights_after_loading has not been called"
+        )
+        assert x.dim() == 2 and x.shape[1] == self.in_features
+        M, K = x.shape
+
+        if self._target == "fp8":
+            # fwht_signs_quant_fp8 folds signs + Hadamard itself and handles
+            # (M, 1024) rows, so run it directly on each raw x block (do NOT
+            # pre-fold signs) and concatenate.
+            qs, amaxes = [], []
+            for b in range(K // _HADAMARD_BLOCK):
+                b0 = b * _HADAMARD_BLOCK
+                q, amax = fwht_signs_quant_fp8(
+                    x.float()[:, b0 : b0 + _HADAMARD_BLOCK],
+                    self.signs[b0 : b0 + _HADAMARD_BLOCK],
+                )
+                qs.append(q)
+                amaxes.append(amax)
+            q = torch.cat(qs, dim=-1)  # (M, K) fp8
+            amax = torch.cat(amaxes, dim=-1)  # (M, K//128) fp32
+            x_dq = (
+                (
+                    q.float().view(M, K // _SCALE_GROUP, _SCALE_GROUP)
+                    * amax.unsqueeze(-1)
+                )
+                .view(M, K)
+                .to(torch.bfloat16)
+            )
+            return torch.matmul(x_dq, self.w_dq_bf16.t())
+        # W4A16-style dequant matmul: xh stays fp32 out of the FWHT, the
+        # bf16 dequantized weights are upcast for the matmul (fp32
+        # accumulate; avoids an extra bf16 rounding of the activations).
+        xh = torch.cat(self._hadamard_blocks(x.float()), dim=1)
+        return torch.matmul(xh, self.w_dq_bf16.t().float())
+
+
+# ---------------------------------------------------------------------------
+# vLLM integration: QuantizationConfig + LinearMethodBase
+# ---------------------------------------------------------------------------
+from torch.nn import Parameter  # noqa: E402
+
+from vllm.model_executor.layers.linear import (  # noqa: E402
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization.base_config import (  # noqa: E402
+    QuantizationConfig,
+)
+from vllm.model_executor.utils import set_weight_attrs  # noqa: E402
+
+
+class BonsaiTernaryQuantConfig(QuantizationConfig):
+    """vLLM config for packed ternary (Q2b1) Bonsai checkpoints.
+
+    The checkpoint's quantization_config dict carries the Hadamard
+    metadata produced by the converter: hadamard_signs maps an input
+    width to the explicit +/-1 sign vector, hadamard_folded lists the
+    (HF-named) weights whose activations receive H @ (signs * x) and
+    hadamard_inverse lists latent lookup tables that receive
+    signs * (H @ row) after the row gather.
+    """
+
+    def __init__(
+        self,
+        ternary_target: str = "auto",
+        hadamard_signs: dict[str, list[int]] | None = None,
+        hadamard_folded: list[str] | None = None,
+        hadamard_inverse: list[str] | None = None,
+        gdn_v_grouped: bool = False,
+    ):
+        super().__init__()
+        self.ternary_target = ternary_target
+        self.hadamard_signs = {
+            int(k): torch.tensor(v, dtype=torch.float32)
+            for k, v in (hadamard_signs or {}).items()
+        }
+        folded = {
+            n[: -len(".weight")] if n.endswith(".weight") else n
+            for n in (hadamard_folded or [])
+        }
+        # vLLM fuses q/k/v -> qkv_proj, gate/up -> gate_up_proj and the GDN
+        # in_proj_qkv + in_proj_z -> in_proj_qkvz at module level; the
+        # checkpoint keeps them separate, so mirror the folded set onto the
+        # fused module prefixes.
+        fused_aliases = {
+            ".q_proj": ".qkv_proj",
+            ".k_proj": ".qkv_proj",
+            ".v_proj": ".qkv_proj",
+            ".gate_proj": ".gate_up_proj",
+            ".up_proj": ".gate_up_proj",
+            ".in_proj_qkv": ".in_proj_qkvz",
+            ".in_proj_z": ".in_proj_qkvz",
+        }
+        for name in list(folded):
+            for src, dst in fused_aliases.items():
+                if name.endswith(src):
+                    folded.add(name[: -len(src)] + dst)
+        self.hadamard_folded = folded
+        self.hadamard_inverse = {
+            n[: -len(".weight")] if n.endswith(".weight") else n
+            for n in (hadamard_inverse or [])
+        }
+        self.gdn_v_grouped = bool(gdn_v_grouped)
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "bonsai_ternary"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16, torch.float16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict) -> "BonsaiTernaryQuantConfig":
+        return cls(
+            ternary_target=config.get("ternary_target", "auto"),
+            hadamard_signs=config.get("hadamard_signs"),
+            hadamard_folded=config.get("hadamard_folded"),
+            hadamard_inverse=config.get("hadamard_inverse"),
+            gdn_v_grouped=config.get("gdn_v_grouped", False),
+        )
+
+    def get_quant_method(self, layer, prefix: str):
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        if not isinstance(layer, (LinearBase, VocabParallelEmbedding)):
+            return None
+        if prefix in self.hadamard_folded or prefix in self.hadamard_inverse:
+            return BonsaiTernaryLinearMethodVLLM(self, prefix)
+        # Non-ternary GDN pieces (in_proj_ba, conv1d) keep full precision.
+        return UnquantizedLinearMethod()
+
+
+class BonsaiTernaryLinearMethodVLLM(LinearMethodBase):
+    """Packed ternary linear with the offline-folded Hadamard rotation.
+
+    Checkpoint tensors: <prefix>.weight (uint8 Q2b1, (N, K//4)) and
+    <prefix>.weight_scale (fp16, (N, K//128)).  After loading, these raw
+    tensors remain resident and are decoded only for requested fallback rows.
+    """
+
+    def __init__(self, quant_config: BonsaiTernaryQuantConfig, prefix: str):
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.is_inverse = prefix in quant_config.hadamard_inverse
+        self.signs: torch.Tensor | None = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        in_features = input_size_per_partition
+        out_features = sum(output_partition_sizes)
+        global_signs = self.quant_config.hadamard_signs.get(input_size)
+        if global_signs is None and input_size == in_features:
+            global_signs = self.quant_config.hadamard_signs.get(in_features)
+        if global_signs is None:
+            raise ValueError(
+                f"no Hadamard signs for input width {input_size} ({self.prefix})"
+            )
+        if input_size == in_features:
+            signs = global_signs
+        else:
+            tp_rank = int(getattr(layer, "tp_rank", 0))
+            start = tp_rank * in_features
+            stop = start + in_features
+            if len(global_signs) != input_size or stop > len(global_signs):
+                raise ValueError(
+                    f"invalid Hadamard signs for TP shard {tp_rank}: "
+                    f"global width {input_size}, local width {in_features}"
+                )
+            signs = global_signs[start:stop].contiguous()
+        self.signs = signs
+
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        # Standard (out, in) orientation: PQ2_0's 128-weight groups run
+        # along the input dim and each checkpoint row is an output feature.
+        base_attrs: dict[str, object] = {"input_dim": 1, "output_dim": 0}
+        # Linear and vocab layers both need their shard-aware loader so packed
+        # rows are sliced on the logical output dimension.
+        if weight_loader is not None:
+            base_attrs["weight_loader"] = weight_loader
+
+        # The checkpoint packs the input dimension: 4 trits per byte and one
+        # fp16 scale per 128 input values. Keep output offsets logical so
+        # merged q/k/v/z loaders populate every output row.
+        packed = Parameter(
+            torch.empty(out_features, in_features // 4, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.register_buffer(
+            "_bonsai_signs", signs.to(packed.device), persistent=False
+        )
+        set_weight_attrs(packed, dict(base_attrs, packed_dim=1, packed_factor=4))
+        layer.register_parameter("weight", packed)
+
+        scale = Parameter(
+            torch.empty(out_features, in_features // 128, dtype=torch.float16),
+            requires_grad=False,
+        )
+        set_weight_attrs(scale, dict(base_attrs, packed_dim=1, packed_factor=128))
+        layer.register_parameter("weight_scale", scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        packed = layer.weight.data.contiguous()
+        scale = layer.weight_scale.data.contiguous()
+        prewarm_m_values = (
+            (1, 2, 4, 8, 16, 32, 64)
+            if os.getenv("BONSAI_FUSED_GEMM_M64") == "1"
+            else (1, 2, 4, 8, 16, 32)
+        )
+        if packed.is_cuda:
+            try:
+                extension = _load_ext()
+                _make_lut(packed.device)
+                if (
+                    os.getenv("BONSAI_FUSED_GEMM") != "0"
+                    and extension is not None
+                    and not torch.compiler.is_compiling()
+                ):
+                    # Up to seven buckets cost 21 timed candidates per unique N/K shape.
+                    prewarm_q2b1_autotune(packed, scale, prewarm_m_values)
+            except BonsaiQ2b1UnavailableError:
+                pass
+        signs = layer._bonsai_signs
+        if signs.device != packed.device:
+            layer._buffers["_bonsai_signs"] = signs.to(packed.device)
+        layer.register_parameter("weight", None)
+        layer.register_parameter("weight_scale", None)
+        layer._bonsai_packed = packed
+        layer._bonsai_scales = scale
+
+    @staticmethod
+    def _dequant_rows(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Decode a packed row chunk to bf16 (bounded memory).
+
+        packed: (m, K//4) uint8, scales: (m, K//128) fp16 -> (m, K) bf16.
+        """
+        m, k4 = packed.shape
+        trits: torch.Tensor | None = None
+        if packed.device.type != "cpu":
+            with suppress(BonsaiQ2b1UnavailableError):
+                trits = (
+                    decode_trits(packed.reshape(-1))
+                    .reshape(m, k4, 4)
+                    .reshape(m, k4 * 4)
+                )
+        if trits is None:
+            trits = _decode_trits_fallback(packed.reshape(-1)).reshape(m, k4 * 4)
+        return (
+            trits.float() * scales.float().repeat_interleave(_SCALE_GROUP, dim=-1)
+        ).to(torch.bfloat16)
+
+    _APPLY_ROW_CHUNK = 16384  # bounds dequantized output-row transients
+
+    def _resolve_signs(
+        self, x: torch.Tensor, signs: torch.Tensor | None
+    ) -> torch.Tensor:
+        signs = self.signs if signs is None else signs
+        assert signs is not None
+        if signs.device != x.device:
+            if x.is_cuda and _is_current_stream_capturing():
+                raise RuntimeError(
+                    "Bonsai Hadamard signs must be moved to the device "
+                    "before CUDA graph capture"
+                )
+            signs = signs.to(x.device)
+        return signs
+
+    def _layer_signs(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        signs = getattr(layer, "_bonsai_signs", self.signs)
+        if signs is None:
+            raise RuntimeError("Bonsai Hadamard signs are not initialized")
+        if signs.device != x.device:
+            if x.is_cuda and _is_current_stream_capturing():
+                raise RuntimeError(
+                    "Bonsai Hadamard signs must be moved to the device "
+                    "before CUDA graph capture"
+                )
+            signs = signs.to(x.device)
+            if "_bonsai_signs" in layer._buffers:
+                layer._buffers["_bonsai_signs"] = signs
+        return signs
+
+    def _rotate(
+        self, x: torch.Tensor, signs: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Forward activation transform: y = H @ (signs * x) per block."""
+        signs = self._resolve_signs(x, signs)
+        k = x.shape[-1]
+        x = x.float()
+        # The converter already places GDN heads in the vLLM target order.
+        # Reordering the output activation here would apply the permutation a
+        # second time before the folded Hadamard transform.
+        nb = k // _HADAMARD_BLOCK
+        outs = []
+        for b in range(nb):
+            s = signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK]
+            outs.append(
+                fwht_signs(x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK], s)
+            )
+        return torch.cat(outs, dim=-1) if nb > 1 else outs[0]
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Standard layout: y = x @ W.T with W (out, in).
+        xh = self._rotate(x, self._layer_signs(layer, x)).float()
+        packed = layer._bonsai_packed
+        scales = layer._bonsai_scales
+        m64_enabled = os.getenv("BONSAI_FUSED_GEMM_M64") == "1"
+        if (
+            os.getenv("BONSAI_FUSED_GEMM") != "0"
+            and x.is_cuda
+            and x.is_contiguous()
+            and xh.is_cuda
+            and xh.is_contiguous()
+            and packed.is_cuda
+            and packed.is_contiguous()
+            and scales.is_cuda
+            and scales.is_contiguous()
+            and xh.shape[0] <= (64 if m64_enabled else 32)
+            and xh.shape[1] % _SCALE_GROUP == 0
+        ):
+            try:
+                out = q2b1_gemm_autotuned(xh, packed, scales)
+            except BonsaiQ2b1UnavailableError:
+                pass
+            else:
+                if bias is not None:
+                    out = out + bias
+                return out
+
+        n = packed.shape[0]
+        out = torch.empty((xh.shape[0], n), dtype=torch.bfloat16, device=xh.device)
+        chunk = self._APPLY_ROW_CHUNK
+        for r0 in range(0, n, chunk):
+            r1 = min(r0 + chunk, n)
+            w = self._dequant_rows(packed[r0:r1], scales[r0:r1])
+            out[:, r0:r1] = (xh @ w.float().transpose(0, 1)).to(torch.bfloat16)
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        idx = input_.long()
+        flat_idx = idx.reshape(-1)
+        if flat_idx.numel() == 0:
+            embedding_dim = layer._bonsai_packed.shape[1] * 4
+            return torch.empty(
+                (*idx.shape, embedding_dim),
+                dtype=torch.bfloat16,
+                device=layer._bonsai_packed.device,
+            )
+        x = self._dequant_rows(
+            layer._bonsai_packed[flat_idx],
+            layer._bonsai_scales[flat_idx],
+        )
+        if self.is_inverse:
+            x = self._inverse_rotate(x, self._layer_signs(layer, x))
+            return x.reshape(*idx.shape, -1)
+        return x.reshape(*idx.shape, -1)
+
+    def _inverse_rotate(
+        self, x: torch.Tensor, signs: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Latent lookup restore: x = signs * (H @ row) per block."""
+        signs = self._resolve_signs(x, signs)
+        k = x.shape[-1]
+        nb = k // _HADAMARD_BLOCK
+        ones = torch.ones(_HADAMARD_BLOCK, device=x.device, dtype=torch.float32)
+        outs = []
+        for b in range(nb):
+            h = fwht_signs(x[:, b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK], ones)
+            s = signs[b * _HADAMARD_BLOCK : (b + 1) * _HADAMARD_BLOCK]
+            outs.append(h * s)
+        y = torch.cat(outs, dim=-1) if nb > 1 else outs[0]
+        return y.to(x.dtype)
