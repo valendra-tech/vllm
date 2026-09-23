@@ -215,6 +215,9 @@ cython_debug/
 # Results
 *.csv
 
+# Git worktrees
+.worktrees/
+
 # Python pickle files
 *.pkl
 
