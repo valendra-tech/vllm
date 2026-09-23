@@ -50,7 +50,7 @@ class GgufMinReader:
             "<4sIQQ", header
         )
         if magic != b"GGUF":
-            raise ValueError(f"invalid GGUF magic: {magic!r}")
+            raise AssertionError("not a GGUF file")
 
         self.kv = {}
         for _ in range(metadata_count):
@@ -81,7 +81,7 @@ class GgufMinReader:
     def _read(self, size: int) -> bytes:
         data = self.f.read(size)
         if len(data) != size:
-            raise ValueError(f"short read: expected {size} bytes, got {len(data)}")
+            raise AssertionError(f"short read: expected {size} bytes, got {len(data)}")
         return data
 
     def _read_string(self) -> str:
@@ -110,13 +110,12 @@ class GgufMinReader:
     def _validate_alignment(alignment: int) -> int:
         if (
             type(alignment) is not int
-            or not 1 <= alignment <= 0xFFFFFFFF
+            or not 8 <= alignment <= 0xFFFFFFFF
             or alignment % 8
-            or alignment & (alignment - 1)
         ):
             raise ValueError(
-                "general.alignment must be a power-of-two multiple of 8 "
-                "between 1 and 4294967295"
+                f"invalid GGUF alignment: {alignment!r}; "
+                "expected a positive uint32 multiple of 8"
             )
         return alignment
 

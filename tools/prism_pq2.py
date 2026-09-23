@@ -85,18 +85,16 @@ def pq2_to_q2b1_bytes(qs) -> np.ndarray:
     raw = np.asarray(qs, dtype=np.uint8)
     if raw.ndim == 1:
         flat = raw
-        block_aligned = flat.size == 0 or flat.size % _BYTES_PER_BLOCK == 0
     elif raw.ndim == 2 and raw.shape[1] == _BYTES_PER_BLOCK:
         flat = raw.reshape(-1)
-        block_aligned = True
     else:
         raise ValueError("PQ2 bytes must have shape (32,) or (n, 32)")
+    if flat.size == 0:
+        return flat.copy()
 
     codes = (flat[:, None] >> _CODE_SHIFTS) & np.uint8(3)
     if np.any(codes == 3):
         raise ValueError("PQ2 code 3 (+2) cannot be represented in Q2b1")
-    if not block_aligned:
-        raise ValueError("PQ2 bytes must contain complete 32-byte blocks")
 
     q2b1_codes = TRIT_TO_Q2B1_CODE[PQ2_CODE_TO_TRIT[codes] + 1]
     return np.bitwise_or.reduce(

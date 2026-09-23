@@ -6,6 +6,7 @@ from itertools import product
 
 import numpy as np
 import pytest
+
 from tools.gguf_reader_min import GgufMinReader, TensorInfo
 from tools.prism_pq2 import (
     PQ2_CODE_TO_TRIT,
@@ -430,9 +431,21 @@ def test_tensor_nbytes_rejects_unsupported_q5_types(ggml_type):
         reader.tensor_nbytes(tensor)
 
 
-def test_gguf_reader_rejects_alignment_not_multiple_of_eight(tmp_path):
+def test_gguf_reader_accepts_alignment_24(tmp_path):
     metadata = [
         _metadata("general.alignment", 4, struct.pack("<I", 24)),
+    ]
+    path = tmp_path / "alignment-24.gguf"
+    path.write_bytes(_make_gguf(metadata, alignment=24))
+
+    reader = GgufMinReader(path)
+
+    assert reader.get_i32("general.alignment") == 24
+
+
+def test_gguf_reader_rejects_alignment_not_multiple_of_eight(tmp_path):
+    metadata = [
+        _metadata("general.alignment", 4, struct.pack("<I", 10)),
     ]
     path = tmp_path / "invalid-alignment.gguf"
     path.write_bytes(_make_gguf(metadata, alignment=32))
@@ -473,7 +486,7 @@ def test_gguf_reader_rejects_invalid_magic(tmp_path):
     path = tmp_path / "invalid-magic.gguf"
     path.write_bytes(struct.pack("<4sIQQ", b"NOPE", 3, 0, 0))
 
-    with pytest.raises(ValueError, match="magic"):
+    with pytest.raises(AssertionError, match="GGUF"):
         GgufMinReader(path)
 
 
@@ -481,7 +494,7 @@ def test_gguf_reader_rejects_truncated_header(tmp_path):
     path = tmp_path / "truncated-header.gguf"
     path.write_bytes(b"GGUF")
 
-    with pytest.raises(ValueError, match="short read"):
+    with pytest.raises(AssertionError, match="short read"):
         GgufMinReader(path)
 
 
@@ -495,7 +508,7 @@ def test_gguf_reader_rejects_truncated_tensor_data(tmp_path):
     )
     reader = GgufMinReader(path)
 
-    with pytest.raises(ValueError, match="short read"):
+    with pytest.raises(AssertionError, match="short read"):
         reader.tensor_data(reader.tensors[0])
 
 
