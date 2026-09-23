@@ -25,11 +25,13 @@ jobs:
           - name: CUDA 13
             tag: cu13
             cuda_version: 13.0.3
+            flashinfer_version: 0.6.18.post1
             build_base_image: pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800e677c51e2a852caf8359
             final_base_image: nvidia/cuda:13.0.3-base-ubuntu24.04
           - name: CUDA 12.8
             tag: cu12.8
             cuda_version: 12.8.1
+            flashinfer_version: 0.6.9
             build_base_image: pytorch/manylinux2_28-builder:cuda12.8
             final_base_image: nvidia/cuda:12.8.1-base-ubuntu24.04
 
@@ -60,6 +62,7 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/vllm:${{ inputs.tag_prefix }}-${{ matrix.tag }}-${{ github.sha }}
           build-args: |
             CUDA_VERSION=${{ matrix.cuda_version }}
+            FLASHINFER_VERSION=${{ matrix.flashinfer_version }}
             BUILD_BASE_IMAGE=${{ matrix.build_base_image }}
             FINAL_BASE_IMAGE=${{ matrix.final_base_image }}
             VLLM_BUILD_COMMIT=${{ github.sha }}
